@@ -44,9 +44,15 @@ CREATE INDEX IF NOT EXISTS idx_sku_master_status ON sku_master (article_status);
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS inventory_snapshot (
   id             bigserial PRIMARY KEY,
+  warehouse      text NOT NULL,    -- which warehouse this snapshot is from (Mala has 2)
   vinculum_sku   text,             -- resolved SKU (from "SKU Desc" column)
   matched        boolean DEFAULT false,  -- true if it matched sku_master
   sku_desc_raw   text,             -- original "SKU Desc" text, unmodified
+  ean            text,             -- raw "SKU"/EAN column, stored as-is for reference
+                                    -- only (NOT used for matching — some exports
+                                    -- corrupt this into scientific notation; see
+                                    -- SETUP.md). Format the column as Text before
+                                    -- exporting CSV to get clean values here.
   mfg_sku_code   text,
   brand_code     text,             -- Brand Code as it appears in the Vinclum export
   total_qty      integer,
@@ -59,13 +65,36 @@ CREATE TABLE IF NOT EXISTS inventory_snapshot (
 
 CREATE INDEX IF NOT EXISTS idx_inv_snap_sku_date ON inventory_snapshot (vinculum_sku, snapshot_date DESC);
 CREATE INDEX IF NOT EXISTS idx_inv_snap_date      ON inventory_snapshot (snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_inv_snap_warehouse ON inventory_snapshot (warehouse, snapshot_date DESC);
 
--- Latest snapshot per SKU = "current inventory"
-CREATE OR REPLACE VIEW v_current_inventory AS
-SELECT DISTINCT ON (vinculum_sku) *
+-- Latest snapshot per SKU PER WAREHOUSE (each warehouse uploads and
+-- refreshes independently, possibly on different dates).
+CREATE OR REPLACE VIEW v_current_inventory_by_warehouse WITH (security_invoker = true) AS
+SELECT DISTINCT ON (vinculum_sku, warehouse) *
 FROM inventory_snapshot
 WHERE vinculum_sku IS NOT NULL AND vinculum_sku <> ''
-ORDER BY vinculum_sku, snapshot_date DESC, uploaded_at DESC;
+ORDER BY vinculum_sku, warehouse, snapshot_date DESC, uploaded_at DESC;
+
+-- "Current inventory" = SUMMED across all warehouses. This is what the
+-- rest of the app (health flags, KPIs) reads — Mala wants combined stock
+-- across both warehouses, not per-warehouse figures.
+-- security_invoker=true: without this, the view runs with the view OWNER's
+-- privileges (which bypass RLS) rather than the querying user's — silently
+-- defeating the RLS policy below. Flagged by Supabase's security advisor.
+CREATE OR REPLACE VIEW v_current_inventory WITH (security_invoker = true) AS
+SELECT
+  vinculum_sku,
+  bool_or(matched) AS matched,
+  MAX(sku_desc_raw) AS sku_desc_raw,
+  MAX(mfg_sku_code) AS mfg_sku_code,
+  MAX(brand_code) AS brand_code,
+  SUM(total_qty) AS total_qty,
+  SUM(available_qty) AS available_qty,
+  MAX(mrp) AS mrp,              -- MRP is a product attribute, not warehouse-specific
+  MAX(snapshot_date) AS snapshot_date,
+  MAX(uploaded_at) AS uploaded_at
+FROM v_current_inventory_by_warehouse
+GROUP BY vinculum_sku;
 
 -- ----------------------------------------------------------------------------
 -- 3. SALES
@@ -130,7 +159,7 @@ CREATE TABLE IF NOT EXISTS upload_log (
 -- Most recent date we actually have sales data for (data isn't always "today"
 -- since it's a monthly pull) — trailing-window calcs are anchored to this.
 CREATE OR REPLACE FUNCTION fn_latest_sales_date() RETURNS date
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   SELECT MAX(order_date) FROM sales;
 $$;
 
@@ -145,7 +174,7 @@ RETURNS TABLE (
   units_cancelled numeric,
   net_revenue     numeric,
   days_in_window  int
-) LANGUAGE sql STABLE AS $$
+) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   SELECT
     s.vinculum_sku,
     s.portal,
@@ -180,7 +209,7 @@ RETURNS TABLE (
   stock_cover_days  numeric,
   sell_through_rate numeric,
   health_flag       text
-) LANGUAGE sql STABLE AS $$
+) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   WITH agg AS (
     SELECT vinculum_sku,
            SUM(units_sold) AS units_sold,
@@ -245,7 +274,7 @@ RETURNS TABLE (
   low_cover_skus     bigint,
   overstock_skus     bigint,
   sell_through_rate  numeric
-) LANGUAGE sql STABLE AS $$
+) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   SELECT
     COUNT(*),
     SUM(available_qty),
@@ -270,7 +299,7 @@ RETURNS TABLE (
   units_sold    numeric,
   units_returned numeric,
   net_revenue   numeric
-) LANGUAGE sql STABLE AS $$
+) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   SELECT
     s.portal,
     s.brand,
@@ -295,7 +324,7 @@ RETURNS TABLE (
   units_cancelled numeric,
   net_revenue    numeric,
   orders         bigint
-) LANGUAGE sql STABLE AS $$
+) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   SELECT
     s.period_key,
     s.portal,
@@ -316,7 +345,7 @@ RETURNS TABLE (
   brand        text,
   units_sold   numeric,
   net_revenue  numeric
-) LANGUAGE plpgsql STABLE AS $$
+) LANGUAGE plpgsql STABLE SET search_path = public, pg_temp AS $$
 BEGIN
   RETURN QUERY
   SELECT s.vinculum_sku, MAX(s.brand), SUM(s.qty) FILTER (WHERE s.status IN ('Shipped complete','delivered','Pick complete','Packed')),
@@ -333,7 +362,7 @@ $$;
 -- Distinct brand list for filter dropdowns — avoids relying on PostgREST's
 -- default 1000-row cap picking up every distinct value by chance.
 CREATE OR REPLACE FUNCTION fn_distinct_brands()
-RETURNS TABLE (brand text) LANGUAGE sql STABLE AS $$
+RETURNS TABLE (brand text) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   SELECT DISTINCT m.brand FROM sku_master m WHERE m.brand IS NOT NULL ORDER BY 1;
 $$;
 

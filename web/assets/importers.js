@@ -67,16 +67,18 @@
     return { rows: out, eanToSku, skuSet };
   }
 
-  function normalizeInventory(rows, masterSkuSet, snapshotDate, sourceFile) {
+  function normalizeInventory(rows, masterSkuSet, snapshotDate, sourceFile, warehouse) {
     const out = [];
     for (const r of rows) {
       const sku_desc_raw = clean(r['SKU Desc']);
       if (!sku_desc_raw) continue;
       const matched = masterSkuSet ? masterSkuSet.has(sku_desc_raw) : false;
       out.push({
+        warehouse,
         vinculum_sku: sku_desc_raw,
         matched,
         sku_desc_raw,
+        ean: clean(r['SKU']),
         mfg_sku_code: clean(r['Mfg SKU Code']),
         brand_code: clean(r['Brand Code']),
         total_qty: toNum(r['Total Quantity']) ?? 0,

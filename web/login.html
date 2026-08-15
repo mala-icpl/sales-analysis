@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in — Iconic Creation Inventory Dashboard</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="assets/config.js"></script>
+<script src="assets/supabase-client.js"></script>
+</head>
+<body>
+  <div class="login-shell">
+    <div class="login-card">
+      <h1>Iconic Creation</h1>
+      <p>Inventory &amp; Sales Health Dashboard</p>
+      <input type="email" id="email" placeholder="Email" autocomplete="username">
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password">
+      <button class="btn" id="login-btn">Sign in</button>
+      <div class="login-error" id="error" style="display:none"></div>
+    </div>
+  </div>
+  <script>
+    (async function () {
+      const { data: { session } } = await sb.auth.getSession();
+      if (session) window.location.href = "index.html";
+    })();
+
+    document.getElementById("login-btn").addEventListener("click", async () => {
+      const email = document.getElementById("email").value.trim();
+      const password = document.getElementById("password").value;
+      const errEl = document.getElementById("error");
+      errEl.style.display = "none";
+      const { error } = await sb.auth.signInWithPassword({ email, password });
+      if (error) {
+        errEl.textContent = error.message;
+        errEl.style.display = "block";
+        return;
+      }
+      window.location.href = "index.html";
+    });
+
+    document.getElementById("password").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("login-btn").click();
+    });
+  </script>
+</body>
+</html>

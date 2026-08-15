@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: iconic-inventory-dashboard
+    runtime: static
+    staticPublishPath: ./web
+    buildCommand: "echo 'no build needed'"
+    pullRequestPreviewsEnabled: false
+    # This is a plain multi-page site (index.html, inventory.html, sales.html,
+    # upload.html, login.html are each real files) — no SPA rewrite needed.

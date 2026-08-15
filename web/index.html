@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Overview — Iconic Creation Inventory Dashboard</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="assets/config.js"></script>
+<script src="assets/supabase-client.js"></script>
+<script src="assets/charts.js"></script>
+<script src="assets/nav.js"></script>
+</head>
+<body>
+<div class="app-shell">
+  <nav class="sidebar" id="app-nav"></nav>
+  <main class="main">
+    <div class="page-header">
+      <div>
+        <h1>Overview</h1>
+        <p>Inventory health and sales performance across all brands and portals.</p>
+      </div>
+      <div class="filter-row">
+        <label>Sales velocity window</label>
+        <select id="days-filter">
+          <option value="30">Trailing 30 days</option>
+          <option value="60">Trailing 60 days</option>
+          <option value="90">Trailing 90 days</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="empty-state" class="empty-state" style="display:none">
+      No data yet. Head to <a href="upload.html">Upload Data</a> to bring in your SKU master, inventory, and sales files.
+    </div>
+
+    <div id="dashboard-content" style="display:none">
+      <div class="kpi-row">
+        <div class="kpi-tile"><div class="kpi-label">Active SKUs</div><div class="kpi-value" id="kpi-skus">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Stock on hand (units)</div><div class="kpi-value" id="kpi-units">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Stock value (at MRP)</div><div class="kpi-value" id="kpi-value">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Net revenue (window)</div><div class="kpi-value" id="kpi-revenue">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Units sold (window)</div><div class="kpi-value" id="kpi-sold">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Sell-through rate</div><div class="kpi-value" id="kpi-str">—</div></div>
+      </div>
+
+      <div class="kpi-row">
+        <div class="kpi-tile"><div class="kpi-label">🔴 Stockouts (reorder now)</div><div class="kpi-value" id="kpi-stockout">—</div><div class="kpi-sub"><a href="inventory.html?flag=STOCKOUT">View SKUs →</a></div></div>
+        <div class="kpi-tile"><div class="kpi-label">🟠 Low stock cover (&lt;15 days)</div><div class="kpi-value" id="kpi-lowcover">—</div><div class="kpi-sub"><a href="inventory.html?flag=LOW_COVER">View SKUs →</a></div></div>
+        <div class="kpi-tile"><div class="kpi-label">⚪ Dead stock (0 sales)</div><div class="kpi-value" id="kpi-dead">—</div><div class="kpi-sub"><a href="inventory.html?flag=DEAD_STOCK">View SKUs →</a></div></div>
+        <div class="kpi-tile"><div class="kpi-label">🟤 Overstock (&gt;90 days cover)</div><div class="kpi-value" id="kpi-overstock">—</div><div class="kpi-sub"><a href="inventory.html?flag=OVERSTOCK">View SKUs →</a></div></div>
+      </div>
+
+      <div class="chart-grid">
+        <div class="card">
+          <h2>Revenue by portal</h2>
+          <p class="card-sub">Net revenue in the selected window, shipped/delivered orders only.</p>
+          <div style="height:280px"><canvas id="chart-portal"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Revenue by brand</h2>
+          <p class="card-sub">Net revenue in the selected window, shipped/delivered orders only.</p>
+          <div style="height:280px"><canvas id="chart-brand"></canvas></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Inventory health mix</h2>
+        <p class="card-sub">Every active SKU, classified by stock-vs-demand in the selected window.</p>
+        <div class="chart-grid">
+          <div style="height:240px"><canvas id="chart-health"></canvas></div>
+          <div id="health-legend" class="legend" style="align-self:center"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="assets/auth-guard.js"></script>
+<script>
+renderNav("dashboard");
+
+let charts = {};
+function destroyCharts() { Object.values(charts).forEach(c => c && c.destroy()); charts = {}; }
+
+async function loadDashboard() {
+  const days = Number(document.getElementById("days-filter").value);
+
+  const { count: skuCount, error: countErr } = await sb.from("sku_master").select("*", { count: "exact", head: true });
+  if (countErr || !skuCount) {
+    document.getElementById("empty-state").style.display = "block";
+    document.getElementById("dashboard-content").style.display = "none";
+    return;
+  }
+  document.getElementById("empty-state").style.display = "none";
+  document.getElementById("dashboard-content").style.display = "block";
+
+  const { data: summaryRows, error: summaryErr } = await sb.rpc("fn_sku_health_summary", { p_days: days });
+  if (summaryErr) { console.error(summaryErr); return; }
+  const s = summaryRows[0];
+
+  document.getElementById("kpi-skus").textContent = fmtNum(s.total_skus);
+  document.getElementById("kpi-units").textContent = fmtNum(s.total_available_units);
+  document.getElementById("kpi-value").textContent = fmtINR(s.total_stock_value);
+  document.getElementById("kpi-revenue").textContent = fmtINR(s.net_revenue);
+  document.getElementById("kpi-sold").textContent = fmtNum(s.units_sold);
+  document.getElementById("kpi-str").textContent = s.sell_through_rate != null ? (s.sell_through_rate * 100).toFixed(1) + "%" : "—";
+  document.getElementById("kpi-stockout").textContent = fmtNum(s.stockout_skus);
+  document.getElementById("kpi-lowcover").textContent = fmtNum(s.low_cover_skus);
+  document.getElementById("kpi-dead").textContent = fmtNum(s.dead_stock_skus);
+  document.getElementById("kpi-overstock").textContent = fmtNum(s.overstock_skus);
+
+  const { data: pb, error: pbErr } = await sb.rpc("fn_portal_brand_summary", { p_days: days });
+  if (pbErr) { console.error(pbErr); return; }
+
+  const byPortal = {};
+  const byBrand = {};
+  (pb || []).forEach(r => {
+    byPortal[r.portal] = (byPortal[r.portal] || 0) + Number(r.net_revenue || 0);
+    byBrand[r.brand] = (byBrand[r.brand] || 0) + Number(r.net_revenue || 0);
+  });
+
+  destroyCharts();
+
+  const portalEntries = Object.entries(byPortal).sort((a, b) => b[1] - a[1]);
+  charts.portal = horizontalBarChart("chart-portal", portalEntries.map(e => e[0]), portalEntries.map(e => e[1]), portalEntries.map(e => portalColor(e[0])), fmtINR);
+
+  const brandEntries = Object.entries(byBrand).sort((a, b) => b[1] - a[1]);
+  charts.brand = horizontalBarChart("chart-brand", brandEntries.map(e => e[0]), brandEntries.map(e => e[1]), brandEntries.map(e => brandColor(e[0])), fmtINR);
+
+  const healthOrder = ["STOCKOUT", "LOW_COVER", "HEALTHY", "OVERSTOCK", "DEAD_STOCK", "DISCONTINUED_OUT"];
+  const healthCounts = {
+    STOCKOUT: s.stockout_skus, LOW_COVER: s.low_cover_skus, OVERSTOCK: s.overstock_skus, DEAD_STOCK: s.dead_stock_skus,
+    HEALTHY: s.total_skus - s.stockout_skus - s.low_cover_skus - s.overstock_skus - s.dead_stock_skus,
+    DISCONTINUED_OUT: 0,
+  };
+  const labels = healthOrder.map(k => HEALTH_LABEL[k]);
+  const values = healthOrder.map(k => healthCounts[k] || 0);
+  const colors = healthOrder.map(k => HEALTH_COLOR[k]);
+  charts.health = donutChart("chart-health", labels, values, colors);
+
+  document.getElementById("health-legend").innerHTML = healthOrder.map((k, i) =>
+    `<span><span class="dot" style="background:${colors[i]}"></span>${labels[i]}: ${fmtNum(values[i])} SKUs</span>`
+  ).join("");
+}
+
+document.getElementById("days-filter").addEventListener("change", loadDashboard);
+loadDashboard();
+</script>
+</body>
+</html>

@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sales Analysis — Iconic Creation Inventory Dashboard</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="assets/config.js"></script>
+<script src="assets/supabase-client.js"></script>
+<script src="assets/charts.js"></script>
+<script src="assets/nav.js"></script>
+</head>
+<body>
+<div class="app-shell">
+  <nav class="sidebar" id="app-nav"></nav>
+  <main class="main">
+    <div class="page-header">
+      <div>
+        <h1>Sales Analysis</h1>
+        <p>Brand-wise and portal-wise performance, by month.</p>
+      </div>
+    </div>
+
+    <div class="filter-row">
+      <label>Period</label>
+      <select id="f-period"><option value="">All uploaded months</option></select>
+      <label>Portal</label>
+      <select id="f-portal"><option value="">All portals</option></select>
+      <label>Brand</label>
+      <select id="f-brand"><option value="">All brands</option></select>
+    </div>
+
+    <div id="empty-state" class="empty-state" style="display:none">
+      No sales data yet. Head to <a href="upload.html">Upload Data</a> to bring in a monthly sales export.
+    </div>
+
+    <div id="content" style="display:none">
+      <div class="kpi-row">
+        <div class="kpi-tile"><div class="kpi-label">Net revenue</div><div class="kpi-value" id="kpi-revenue">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Units sold (net)</div><div class="kpi-value" id="kpi-units">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Units returned</div><div class="kpi-value" id="kpi-returned">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Return rate</div><div class="kpi-value" id="kpi-return-rate">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Orders</div><div class="kpi-value" id="kpi-orders">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Avg order value</div><div class="kpi-value" id="kpi-aov">—</div></div>
+      </div>
+
+      <div class="card">
+        <h2>Revenue trend by month</h2>
+        <p class="card-sub">One line per portal. Only shows once more than one month is uploaded.</p>
+        <div style="height:280px"><canvas id="chart-trend"></canvas></div>
+      </div>
+
+      <div class="chart-grid">
+        <div class="card">
+          <h2>Revenue by portal</h2>
+          <div style="height:260px"><canvas id="chart-portal"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Revenue by brand</h2>
+          <div style="height:260px"><canvas id="chart-brand"></canvas></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Portal × Brand breakdown</h2>
+        <div class="table-wrap" style="max-height:320px">
+          <table>
+            <thead><tr><th>Portal</th><th>Brand</th><th>Units sold</th><th>Units returned</th><th>Net revenue</th></tr></thead>
+            <tbody id="matrix-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="chart-grid">
+        <div class="card">
+          <h2>Top 15 SKUs by revenue</h2>
+          <div class="table-wrap" style="max-height:400px">
+            <table><thead><tr><th>SKU</th><th>Brand</th><th>Units</th><th>Revenue</th></tr></thead><tbody id="top-body"></tbody></table>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Bottom 15 SKUs by revenue (still selling)</h2>
+          <div class="table-wrap" style="max-height:400px">
+            <table><thead><tr><th>SKU</th><th>Brand</th><th>Units</th><th>Revenue</th></tr></thead><tbody id="bottom-body"></tbody></table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="assets/auth-guard.js"></script>
+<script>
+renderNav("sales");
+
+let allRows = [];
+let charts = {};
+function destroyCharts() { Object.values(charts).forEach(c => c && c.destroy()); charts = {}; }
+
+function filteredRows() {
+  const period = document.getElementById("f-period").value;
+  const portal = document.getElementById("f-portal").value;
+  const brand = document.getElementById("f-brand").value;
+  return allRows.filter(r =>
+    (!period || r.period_key === period) &&
+    (!portal || r.portal === portal) &&
+    (!brand || r.brand === brand)
+  );
+}
+
+function renderKpis(rows) {
+  const revenue = rows.reduce((a, r) => a + Number(r.net_revenue || 0), 0);
+  const units = rows.reduce((a, r) => a + Number(r.units_sold || 0), 0);
+  const returned = rows.reduce((a, r) => a + Number(r.units_returned || 0), 0);
+  const orders = rows.reduce((a, r) => a + Number(r.orders || 0), 0);
+  document.getElementById("kpi-revenue").textContent = fmtINR(revenue);
+  document.getElementById("kpi-units").textContent = fmtNum(units);
+  document.getElementById("kpi-returned").textContent = fmtNum(returned);
+  document.getElementById("kpi-return-rate").textContent = (units + returned) ? ((100 * returned / (units + returned)).toFixed(1) + "%") : "—";
+  document.getElementById("kpi-orders").textContent = fmtNum(orders);
+  document.getElementById("kpi-aov").textContent = orders ? fmtINR(revenue / orders) : "—";
+}
+
+function renderPortalBrandCharts(rows) {
+  const byPortal = {}, byBrand = {};
+  rows.forEach(r => {
+    byPortal[r.portal] = (byPortal[r.portal] || 0) + Number(r.net_revenue || 0);
+    byBrand[r.brand] = (byBrand[r.brand] || 0) + Number(r.net_revenue || 0);
+  });
+  const pe = Object.entries(byPortal).sort((a, b) => b[1] - a[1]);
+  const be = Object.entries(byBrand).sort((a, b) => b[1] - a[1]);
+  charts.portal = horizontalBarChart("chart-portal", pe.map(e => e[0]), pe.map(e => e[1]), pe.map(e => portalColor(e[0])), fmtINR);
+  charts.brand = horizontalBarChart("chart-brand", be.map(e => e[0]), be.map(e => e[1]), be.map(e => brandColor(e[0])), fmtINR);
+}
+
+function renderTrend(rows) {
+  const periods = [...new Set(rows.map(r => r.period_key))].sort();
+  const portals = [...new Set(rows.map(r => r.portal))];
+  if (periods.length < 2) {
+    document.getElementById("chart-trend").parentElement.parentElement.style.display = "none";
+    return;
+  }
+  document.getElementById("chart-trend").parentElement.parentElement.style.display = "block";
+  const datasets = portals.map(p => ({
+    label: p,
+    color: portalColor(p),
+    data: periods.map(pk => rows.filter(r => r.period_key === pk && r.portal === p).reduce((a, r) => a + Number(r.net_revenue || 0), 0)),
+  }));
+  charts.trend = lineChart("chart-trend", periods, datasets);
+}
+
+function renderMatrix(rows) {
+  const key = r => r.portal + "||" + r.brand;
+  const grouped = {};
+  rows.forEach(r => {
+    const k = key(r);
+    if (!grouped[k]) grouped[k] = { portal: r.portal, brand: r.brand, units_sold: 0, units_returned: 0, net_revenue: 0 };
+    grouped[k].units_sold += Number(r.units_sold || 0);
+    grouped[k].units_returned += Number(r.units_returned || 0);
+    grouped[k].net_revenue += Number(r.net_revenue || 0);
+  });
+  const arr = Object.values(grouped).sort((a, b) => b.net_revenue - a.net_revenue);
+  document.getElementById("matrix-body").innerHTML = arr.map(r => `
+    <tr><td>${r.portal}</td><td>${r.brand}</td><td>${fmtNum(r.units_sold)}</td><td>${fmtNum(r.units_returned)}</td><td>${fmtINR(r.net_revenue)}</td></tr>
+  `).join("") || `<tr><td colspan="5" class="empty-state">No data</td></tr>`;
+}
+
+async function renderTopBottom() {
+  const period = document.getElementById("f-period").value || null;
+  const [{ data: top }, { data: bottom }] = await Promise.all([
+    sb.rpc("fn_top_skus", { p_period_key: period, p_limit: 15, p_ascending: false }),
+    sb.rpc("fn_top_skus", { p_period_key: period, p_limit: 15, p_ascending: true }),
+  ]);
+  const row = r => `<tr><td class="mono">${r.vinculum_sku}</td><td>${r.brand || "—"}</td><td>${fmtNum(r.units_sold)}</td><td>${fmtINR(r.net_revenue)}</td></tr>`;
+  document.getElementById("top-body").innerHTML = (top || []).map(row).join("") || `<tr><td colspan="4" class="empty-state">No data</td></tr>`;
+  document.getElementById("bottom-body").innerHTML = (bottom || []).filter(r => Number(r.units_sold) > 0).map(row).join("") || `<tr><td colspan="4" class="empty-state">No data</td></tr>`;
+}
+
+async function loadPage() {
+  const { data, error } = await sb.rpc("fn_sales_by_period");
+  if (error) { console.error(error); return; }
+  allRows = data || [];
+
+  if (allRows.length === 0) {
+    document.getElementById("empty-state").style.display = "block";
+    document.getElementById("content").style.display = "none";
+    return;
+  }
+  document.getElementById("empty-state").style.display = "none";
+  document.getElementById("content").style.display = "block";
+
+  const periods = [...new Set(allRows.map(r => r.period_key))].sort();
+  const portals = [...new Set(allRows.map(r => r.portal))].sort();
+  const brands = [...new Set(allRows.map(r => r.brand))].sort();
+  const periodSel = document.getElementById("f-period");
+  periods.forEach(p => { const o = document.createElement("option"); o.value = p; o.textContent = p; periodSel.appendChild(o); });
+  const portalSel = document.getElementById("f-portal");
+  portals.forEach(p => { const o = document.createElement("option"); o.value = p; o.textContent = p; portalSel.appendChild(o); });
+  const brandSel = document.getElementById("f-brand");
+  brands.forEach(b => { const o = document.createElement("option"); o.value = b; o.textContent = b; brandSel.appendChild(o); });
+
+  refresh();
+}
+
+function refresh() {
+  const rows = filteredRows();
+  destroyCharts();
+  renderKpis(rows);
+  renderPortalBrandCharts(rows);
+  renderTrend(filteredRows_forTrend());
+  renderMatrix(rows);
+  renderTopBottom();
+}
+
+// trend should ignore the period filter (it needs multiple periods to plot)
+// but respect portal/brand filters.
+function filteredRows_forTrend() {
+  const portal = document.getElementById("f-portal").value;
+  const brand = document.getElementById("f-brand").value;
+  return allRows.filter(r => (!portal || r.portal === portal) && (!brand || r.brand === brand));
+}
+
+["f-period", "f-portal", "f-brand"].forEach(id => document.getElementById(id).addEventListener("change", refresh));
+loadPage();
+</script>
+</body>
+</html>

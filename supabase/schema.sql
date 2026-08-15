@@ -1,0 +1,364 @@
+-- ============================================================================
+-- Iconic Creation — Inventory & Sales Health Dashboard
+-- Database schema for Supabase (Postgres)
+-- ============================================================================
+-- Run this once in the Supabase SQL editor (or via `psql`) on a fresh project.
+-- Safe to re-run: uses CREATE TABLE IF NOT EXISTS / CREATE OR REPLACE.
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 1. SKU MASTER
+-- One row per Vinculum SKU (Article_Color_Size). This is the bridge table:
+-- it links the internal SKU to every portal's own product ID (ASIN, FSN, etc.)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sku_master (
+  vinculum_sku       text PRIMARY KEY,
+  article            text,
+  article_color      text,
+  color              text,
+  size               text,
+  ean                text,
+  brand              text,
+  mrp                numeric,
+  item_type_name     text,
+  myntra_item_type   text,
+  myntra_style_id    text,
+  asin               text,
+  fsn                text,
+  jio_code           text,
+  nykaa_product_id   text,
+  article_status     text,        -- 'Article Live' | 'Discontinue' | 'Inactive'
+  updated_at         timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sku_master_ean   ON sku_master (ean);
+CREATE INDEX IF NOT EXISTS idx_sku_master_brand ON sku_master (brand);
+CREATE INDEX IF NOT EXISTS idx_sku_master_article ON sku_master (article);
+CREATE INDEX IF NOT EXISTS idx_sku_master_status ON sku_master (article_status);
+
+-- ----------------------------------------------------------------------------
+-- 2. INVENTORY SNAPSHOTS
+-- Each upload adds a new snapshot batch (snapshot_date). We keep history so
+-- stock trends can be charted later; the app always reads the LATEST snapshot
+-- per SKU via v_current_inventory below.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS inventory_snapshot (
+  id             bigserial PRIMARY KEY,
+  vinculum_sku   text,             -- resolved SKU (from "SKU Desc" column)
+  matched        boolean DEFAULT false,  -- true if it matched sku_master
+  sku_desc_raw   text,             -- original "SKU Desc" text, unmodified
+  mfg_sku_code   text,
+  brand_code     text,             -- Brand Code as it appears in the Vinclum export
+  total_qty      integer,
+  available_qty  integer,
+  mrp            numeric,
+  snapshot_date  date NOT NULL,
+  uploaded_at    timestamptz DEFAULT now(),
+  source_file    text
+);
+
+CREATE INDEX IF NOT EXISTS idx_inv_snap_sku_date ON inventory_snapshot (vinculum_sku, snapshot_date DESC);
+CREATE INDEX IF NOT EXISTS idx_inv_snap_date      ON inventory_snapshot (snapshot_date);
+
+-- Latest snapshot per SKU = "current inventory"
+CREATE OR REPLACE VIEW v_current_inventory AS
+SELECT DISTINCT ON (vinculum_sku) *
+FROM inventory_snapshot
+WHERE vinculum_sku IS NOT NULL AND vinculum_sku <> ''
+ORDER BY vinculum_sku, snapshot_date DESC, uploaded_at DESC;
+
+-- ----------------------------------------------------------------------------
+-- 3. SALES
+-- One row per order line. Uploaded as monthly pulls; each upload replaces any
+-- existing rows for that period_key (so re-uploading the same month doesn't
+-- double-count).
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sales (
+  id                  bigserial PRIMARY KEY,
+  client_sku_ean      text,      -- raw "ClientSKU" column from Vinclum (= EAN)
+  vinculum_sku        text,      -- resolved via sku_master.ean -> vinculum_sku
+  matched             boolean DEFAULT false,
+  brand               text,      -- taken directly from the sales file (reliable)
+  order_channel_raw   text,      -- raw "Order Channel" value
+  portal              text,      -- grouped portal: Myntra / Nykaa Fashion / Nykaa.com / Ajio / Flipkart / Amazon / Tata Cliq / Own Website / Other
+  entity              text,      -- ICPL / Global / Iconic / Unknown
+  unit                text,      -- Unit1 / Unit2 / null
+  status              text,      -- Shipped complete / delivered / Shipped & Returned / Cancelled / Packed / Pick complete
+  qty                 numeric,
+  mrp                 numeric,
+  selling_price       numeric,
+  order_amount        numeric,
+  line_amount         numeric,
+  order_date          date,
+  invoice_date        date,
+  invoice_no          text,
+  order_no            text,
+  external_order_no   text,
+  source_warehouse    text,
+  period_key          text NOT NULL,   -- 'YYYY-MM', derived from OrderDate at upload time
+  uploaded_at         timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sales_sku        ON sales (vinculum_sku);
+CREATE INDEX IF NOT EXISTS idx_sales_period     ON sales (period_key);
+CREATE INDEX IF NOT EXISTS idx_sales_portal     ON sales (portal);
+CREATE INDEX IF NOT EXISTS idx_sales_brand      ON sales (brand);
+CREATE INDEX IF NOT EXISTS idx_sales_order_date ON sales (order_date);
+CREATE INDEX IF NOT EXISTS idx_sales_status     ON sales (status);
+
+-- ----------------------------------------------------------------------------
+-- 4. UPLOAD LOG (simple audit trail, shown on the Upload/Admin page)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS upload_log (
+  id             bigserial PRIMARY KEY,
+  file_type      text NOT NULL,     -- 'sku_master' | 'inventory' | 'sales'
+  file_name      text,
+  period_key     text,              -- for sales uploads
+  snapshot_date  date,              -- for inventory uploads
+  row_count      integer,
+  matched_count  integer,
+  unmatched_count integer,
+  uploaded_by    text,
+  uploaded_at    timestamptz DEFAULT now(),
+  notes          text
+);
+
+-- ----------------------------------------------------------------------------
+-- 5. HELPER FUNCTIONS
+-- ----------------------------------------------------------------------------
+
+-- Most recent date we actually have sales data for (data isn't always "today"
+-- since it's a monthly pull) — trailing-window calcs are anchored to this.
+CREATE OR REPLACE FUNCTION fn_latest_sales_date() RETURNS date
+LANGUAGE sql STABLE AS $$
+  SELECT MAX(order_date) FROM sales;
+$$;
+
+-- Per-SKU, per-portal sales aggregated over a trailing window of p_days,
+-- anchored to fn_latest_sales_date() rather than real "today".
+CREATE OR REPLACE FUNCTION fn_sku_sales_agg(p_days int)
+RETURNS TABLE (
+  vinculum_sku    text,
+  portal          text,
+  units_sold      numeric,
+  units_returned  numeric,
+  units_cancelled numeric,
+  net_revenue     numeric,
+  days_in_window  int
+) LANGUAGE sql STABLE AS $$
+  SELECT
+    s.vinculum_sku,
+    s.portal,
+    SUM(CASE WHEN s.status IN ('Shipped complete','delivered','Pick complete','Packed') THEN s.qty ELSE 0 END) AS units_sold,
+    SUM(CASE WHEN s.status = 'Shipped & Returned' THEN s.qty ELSE 0 END) AS units_returned,
+    SUM(CASE WHEN s.status = 'Cancelled' THEN s.qty ELSE 0 END) AS units_cancelled,
+    SUM(CASE WHEN s.status IN ('Shipped complete','delivered','Pick complete','Packed') THEN s.line_amount ELSE 0 END) AS net_revenue,
+    p_days AS days_in_window
+  FROM sales s
+  WHERE s.vinculum_sku IS NOT NULL
+    AND s.order_date > fn_latest_sales_date() - (p_days || ' days')::interval
+  GROUP BY s.vinculum_sku, s.portal;
+$$;
+
+-- Full SKU health table: master info + current stock + trailing sales,
+-- summed across all portals. This is what the Inventory Health page reads.
+CREATE OR REPLACE FUNCTION fn_sku_health(p_days int DEFAULT 30)
+RETURNS TABLE (
+  vinculum_sku      text,
+  article           text,
+  color             text,
+  size              text,
+  brand             text,
+  article_status    text,
+  mrp               numeric,
+  available_qty     integer,
+  total_qty         integer,
+  units_sold        numeric,
+  units_returned    numeric,
+  net_revenue       numeric,
+  daily_velocity    numeric,
+  stock_cover_days  numeric,
+  sell_through_rate numeric,
+  health_flag       text
+) LANGUAGE sql STABLE AS $$
+  WITH agg AS (
+    SELECT vinculum_sku,
+           SUM(units_sold) AS units_sold,
+           SUM(units_returned) AS units_returned,
+           SUM(net_revenue) AS net_revenue
+    FROM fn_sku_sales_agg(p_days)
+    GROUP BY vinculum_sku
+  )
+  SELECT
+    m.vinculum_sku,
+    m.article,
+    m.color,
+    m.size,
+    m.brand,
+    m.article_status,
+    m.mrp,
+    COALESCE(i.available_qty, 0) AS available_qty,
+    COALESCE(i.total_qty, 0) AS total_qty,
+    COALESCE(a.units_sold, 0) AS units_sold,
+    COALESCE(a.units_returned, 0) AS units_returned,
+    COALESCE(a.net_revenue, 0) AS net_revenue,
+    ROUND(COALESCE(a.units_sold, 0) / GREATEST(p_days, 1)::numeric, 3) AS daily_velocity,
+    CASE
+      WHEN COALESCE(a.units_sold, 0) = 0 THEN NULL  -- no sales velocity to project from
+      ELSE ROUND(COALESCE(i.available_qty, 0) / (COALESCE(a.units_sold, 0) / GREATEST(p_days, 1)::numeric), 1)
+    END AS stock_cover_days,
+    CASE
+      WHEN (COALESCE(a.units_sold, 0) + COALESCE(i.available_qty, 0)) = 0 THEN NULL
+      ELSE ROUND(COALESCE(a.units_sold, 0)::numeric / (COALESCE(a.units_sold, 0) + COALESCE(i.available_qty, 0)), 3)
+    END AS sell_through_rate,
+    CASE
+      WHEN COALESCE(i.available_qty, 0) = 0 AND COALESCE(a.units_sold,0) > 0 AND m.article_status = 'Article Live'
+        THEN 'STOCKOUT'          -- selling, live, out of stock: reorder
+      WHEN COALESCE(i.available_qty, 0) = 0 AND COALESCE(a.units_sold,0) > 0 AND m.article_status <> 'Article Live'
+        THEN 'DISCONTINUED_OUT'  -- sold out, but discontinued: informational only, no reorder
+      WHEN COALESCE(i.available_qty, 0) > 0 AND COALESCE(a.units_sold, 0) = 0
+        THEN 'DEAD_STOCK'        -- stock sitting, nothing sold in window
+      WHEN COALESCE(a.units_sold, 0) > 0 AND COALESCE(i.available_qty, 0) / (COALESCE(a.units_sold, 0) / GREATEST(p_days, 1)::numeric) < 15
+        THEN 'LOW_COVER'         -- selling, less than ~2 weeks of stock left
+      WHEN COALESCE(a.units_sold, 0) > 0 AND COALESCE(i.available_qty, 0) / (COALESCE(a.units_sold, 0) / GREATEST(p_days, 1)::numeric) > 90
+        THEN 'OVERSTOCK'         -- selling, but more than 3 months of stock on hand
+      ELSE 'HEALTHY'
+    END AS health_flag
+  FROM sku_master m
+  LEFT JOIN v_current_inventory i ON i.vinculum_sku = m.vinculum_sku
+  LEFT JOIN agg a ON a.vinculum_sku = m.vinculum_sku
+  WHERE m.article_status <> 'Inactive' OR m.article_status IS NULL;
+$$;
+
+-- One-row summary used by the Overview dashboard's KPI tiles, so the
+-- browser doesn't have to pull all ~60k SKU rows just to add them up.
+CREATE OR REPLACE FUNCTION fn_sku_health_summary(p_days int DEFAULT 30)
+RETURNS TABLE (
+  total_skus         bigint,
+  total_available_units bigint,
+  total_stock_value  numeric,
+  units_sold         numeric,
+  net_revenue        numeric,
+  dead_stock_skus    bigint,
+  dead_stock_units   bigint,
+  stockout_skus      bigint,
+  low_cover_skus     bigint,
+  overstock_skus     bigint,
+  sell_through_rate  numeric
+) LANGUAGE sql STABLE AS $$
+  SELECT
+    COUNT(*),
+    SUM(available_qty),
+    SUM(available_qty * COALESCE(mrp, 0)),
+    SUM(units_sold),
+    SUM(net_revenue),
+    COUNT(*) FILTER (WHERE health_flag = 'DEAD_STOCK'),
+    SUM(available_qty) FILTER (WHERE health_flag = 'DEAD_STOCK'),
+    COUNT(*) FILTER (WHERE health_flag = 'STOCKOUT'),
+    COUNT(*) FILTER (WHERE health_flag = 'LOW_COVER'),
+    COUNT(*) FILTER (WHERE health_flag = 'OVERSTOCK'),
+    ROUND(SUM(units_sold) / NULLIF(SUM(units_sold) + SUM(available_qty), 0), 3)
+  FROM fn_sku_health(p_days);
+$$;
+
+-- Portal x Brand sales rollup for a trailing window — feeds the Overview and
+-- Sales Analysis charts without shipping row-level data to the browser.
+CREATE OR REPLACE FUNCTION fn_portal_brand_summary(p_days int DEFAULT 30)
+RETURNS TABLE (
+  portal        text,
+  brand         text,
+  units_sold    numeric,
+  units_returned numeric,
+  net_revenue   numeric
+) LANGUAGE sql STABLE AS $$
+  SELECT
+    s.portal,
+    s.brand,
+    SUM(CASE WHEN s.status IN ('Shipped complete','delivered','Pick complete','Packed') THEN s.qty ELSE 0 END),
+    SUM(CASE WHEN s.status = 'Shipped & Returned' THEN s.qty ELSE 0 END),
+    SUM(CASE WHEN s.status IN ('Shipped complete','delivered','Pick complete','Packed') THEN s.line_amount ELSE 0 END)
+  FROM sales s
+  WHERE s.order_date > fn_latest_sales_date() - (p_days || ' days')::interval
+  GROUP BY s.portal, s.brand;
+$$;
+
+-- Full period x portal x brand breakdown — small result set (months x 8
+-- portals x ~4 brands), fetched once by the Sales Analysis page and sliced
+-- in the browser for the period picker / trend chart / portal-brand toggle.
+CREATE OR REPLACE FUNCTION fn_sales_by_period()
+RETURNS TABLE (
+  period_key     text,
+  portal         text,
+  brand          text,
+  units_sold     numeric,
+  units_returned numeric,
+  units_cancelled numeric,
+  net_revenue    numeric,
+  orders         bigint
+) LANGUAGE sql STABLE AS $$
+  SELECT
+    s.period_key,
+    s.portal,
+    s.brand,
+    SUM(CASE WHEN s.status IN ('Shipped complete','delivered','Pick complete','Packed') THEN s.qty ELSE 0 END),
+    SUM(CASE WHEN s.status = 'Shipped & Returned' THEN s.qty ELSE 0 END),
+    SUM(CASE WHEN s.status = 'Cancelled' THEN s.qty ELSE 0 END),
+    SUM(CASE WHEN s.status IN ('Shipped complete','delivered','Pick complete','Packed') THEN s.line_amount ELSE 0 END),
+    COUNT(DISTINCT s.invoice_no)
+  FROM sales s
+  GROUP BY s.period_key, s.portal, s.brand;
+$$;
+
+-- Top/bottom SKUs by net revenue for a given period (NULL = all periods).
+CREATE OR REPLACE FUNCTION fn_top_skus(p_period_key text DEFAULT NULL, p_limit int DEFAULT 15, p_ascending boolean DEFAULT false)
+RETURNS TABLE (
+  vinculum_sku text,
+  brand        text,
+  units_sold   numeric,
+  net_revenue  numeric
+) LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  RETURN QUERY
+  SELECT s.vinculum_sku, MAX(s.brand), SUM(s.qty) FILTER (WHERE s.status IN ('Shipped complete','delivered','Pick complete','Packed')),
+         SUM(s.line_amount) FILTER (WHERE s.status IN ('Shipped complete','delivered','Pick complete','Packed'))
+  FROM sales s
+  WHERE s.vinculum_sku IS NOT NULL AND (p_period_key IS NULL OR s.period_key = p_period_key)
+  GROUP BY s.vinculum_sku
+  ORDER BY CASE WHEN p_ascending THEN SUM(s.line_amount) FILTER (WHERE s.status IN ('Shipped complete','delivered','Pick complete','Packed')) END ASC NULLS LAST,
+           CASE WHEN NOT p_ascending THEN SUM(s.line_amount) FILTER (WHERE s.status IN ('Shipped complete','delivered','Pick complete','Packed')) END DESC NULLS LAST
+  LIMIT p_limit;
+END;
+$$;
+
+-- Distinct brand list for filter dropdowns — avoids relying on PostgREST's
+-- default 1000-row cap picking up every distinct value by chance.
+CREATE OR REPLACE FUNCTION fn_distinct_brands()
+RETURNS TABLE (brand text) LANGUAGE sql STABLE AS $$
+  SELECT DISTINCT m.brand FROM sku_master m WHERE m.brand IS NOT NULL ORDER BY 1;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- 6. ROW LEVEL SECURITY
+-- This is a private internal tool. Only authenticated (logged-in) users may
+-- read or write. No public/anon access.
+-- ----------------------------------------------------------------------------
+ALTER TABLE sku_master        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inventory_snapshot ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sales              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE upload_log         ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "authenticated read/write sku_master" ON sku_master;
+CREATE POLICY "authenticated read/write sku_master" ON sku_master
+  FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');
+
+DROP POLICY IF EXISTS "authenticated read/write inventory_snapshot" ON inventory_snapshot;
+CREATE POLICY "authenticated read/write inventory_snapshot" ON inventory_snapshot
+  FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');
+
+DROP POLICY IF EXISTS "authenticated read/write sales" ON sales;
+CREATE POLICY "authenticated read/write sales" ON sales
+  FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');
+
+DROP POLICY IF EXISTS "authenticated read/write upload_log" ON upload_log;
+CREATE POLICY "authenticated read/write upload_log" ON upload_log
+  FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');

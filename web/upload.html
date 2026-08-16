@@ -124,6 +124,32 @@ function readFileAsArrayBuffer(file) {
   });
 }
 
+// Scans only the first `maxRows` rows of a sheet for a marker cell (e.g.
+// "Vinculum SKU"), without materializing the whole sheet into memory first.
+// Large Vinclum exports (tens/hundreds of thousands of rows) made the old
+// approach — sheet_to_json(sheet, {header:1}) with NO range, then slicing
+// the result down to the first few rows — parse the ENTIRE sheet twice just
+// to find a header that's almost always in the first 10 rows. On a big
+// multi-month file that's slow enough to freeze the tab and trigger
+// Chrome's "page isn't responding" warning. Capping the range up front
+// keeps this scan pass to a handful of rows regardless of file size.
+// Returns the header row index (0-based, real sheet row number), or -1 if
+// the marker wasn't found within maxRows.
+function findHeaderRow(sheet, markerCell, maxRows) {
+  if (!sheet || !sheet["!ref"]) return -1;
+  const full = XLSX.utils.decode_range(sheet["!ref"]);
+  const capped = { s: { r: full.s.r, c: full.s.c }, e: { r: Math.min(full.e.r, full.s.r + maxRows - 1), c: full.e.c } };
+  // IMPORTANT: no `blankrows: false` here — that option drops blank rows
+  // from the returned array, which shifts array indices out of sync with
+  // real sheet row numbers, and the index math below assumes they line up.
+  const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, range: capped });
+  for (let i = 0; i < raw.length; i++) {
+    const row = raw[i];
+    if (row && row.some(cell => typeof cell === "string" && cell.trim() === markerCell)) return full.s.r + i;
+  }
+  return -1;
+}
+
 // Finds the row that actually contains the header, by looking for a marker
 // cell (e.g. "Vinculum SKU"), then parses from there. Handles Vinclum's
 // SKU Master export having a blank first row above the real header.
@@ -132,17 +158,8 @@ async function parseSheetWithMarker(file, sheetIndexOrName, markerCell) {
   const wb = XLSX.read(buf, { type: "array" });
   const sheetName = typeof sheetIndexOrName === "number" ? wb.SheetNames[sheetIndexOrName] : sheetIndexOrName;
   const sheet = wb.Sheets[sheetName];
-  // IMPORTANT: no `blankrows: false` here — that option drops blank rows
-  // from the returned array, which shifts array indices out of sync with
-  // real sheet row numbers. Since `range` below is a real sheet row number,
-  // the indices must line up, or this silently finds nothing and every
-  // downstream row gets skipped.
-  const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
-  let headerRow = 0;
-  for (let i = 0; i < Math.min(raw.length, 5); i++) {
-    if (raw[i] && raw[i].includes(markerCell)) { headerRow = i; break; }
-  }
-  return XLSX.utils.sheet_to_json(sheet, { range: headerRow, defval: null });
+  const found = findHeaderRow(sheet, markerCell, 5);
+  return XLSX.utils.sheet_to_json(sheet, { range: found >= 0 ? found : 0, defval: null });
 }
 
 // Like parseSheetWithMarker, but also scans EVERY sheet in the workbook (not
@@ -159,13 +176,9 @@ async function parseSheetRobust(file, markerCell) {
   const wb = XLSX.read(buf, { type: "array" });
   for (const sheetName of wb.SheetNames) {
     const sheet = wb.Sheets[sheetName];
-    if (!sheet || !sheet["!ref"]) continue; // empty/blank sheet, skip
-    const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
-    for (let i = 0; i < Math.min(raw.length, 10); i++) {
-      const row = raw[i];
-      if (row && row.some(cell => typeof cell === "string" && cell.trim() === markerCell)) {
-        return XLSX.utils.sheet_to_json(sheet, { range: i, defval: null });
-      }
+    const headerRow = findHeaderRow(sheet, markerCell, 10);
+    if (headerRow >= 0) {
+      return XLSX.utils.sheet_to_json(sheet, { range: headerRow, defval: null });
     }
   }
   // Marker not found on any sheet — fall back to the original behaviour.

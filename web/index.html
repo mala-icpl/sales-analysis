@@ -50,6 +50,7 @@
         <div class="kpi-tile"><div class="kpi-label">🟠 Low stock cover (&lt;15 days)</div><div class="kpi-value" id="kpi-lowcover">—</div><div class="kpi-sub"><a href="inventory.html?flag=LOW_COVER">View SKUs →</a></div></div>
         <div class="kpi-tile"><div class="kpi-label">⚪ Dead stock (0 sales)</div><div class="kpi-value" id="kpi-dead">—</div><div class="kpi-sub"><a href="inventory.html?flag=DEAD_STOCK">View SKUs →</a></div></div>
         <div class="kpi-tile"><div class="kpi-label">🟤 Overstock (&gt;90 days cover)</div><div class="kpi-value" id="kpi-overstock">—</div><div class="kpi-sub"><a href="inventory.html?flag=OVERSTOCK">View SKUs →</a></div></div>
+        <div class="kpi-tile"><div class="kpi-label">⚫ Legacy (not in SKU Master)</div><div class="kpi-value" id="kpi-legacy">—</div><div class="kpi-sub"><a href="inventory.html?flag=LEGACY_UNMAPPED">View SKUs →</a></div></div>
       </div>
 
       <div class="chart-grid">
@@ -86,8 +87,16 @@ function destroyCharts() { Object.values(charts).forEach(c => c && c.destroy());
 async function loadDashboard() {
   const days = Number(document.getElementById("days-filter").value);
 
-  const { count: skuCount, error: countErr } = await sb.from("sku_master").select("*", { count: "exact", head: true });
-  if (countErr || !skuCount) {
+  // Any of the three sources having data is enough to show the dashboard —
+  // e.g. inventory/sales can be uploaded before SKU Master, and legacy SKUs
+  // (never in master) still show up via fn_sku_health's LEGACY_UNMAPPED flag.
+  const [masterC, invC, salesC] = await Promise.all([
+    sb.from("sku_master").select("*", { count: "exact", head: true }),
+    sb.from("inventory_snapshot").select("*", { count: "exact", head: true }),
+    sb.from("sales").select("*", { count: "exact", head: true }),
+  ]);
+  const hasData = (masterC.count || 0) > 0 || (invC.count || 0) > 0 || (salesC.count || 0) > 0;
+  if (!hasData) {
     document.getElementById("empty-state").style.display = "block";
     document.getElementById("dashboard-content").style.display = "none";
     return;
@@ -109,6 +118,7 @@ async function loadDashboard() {
   document.getElementById("kpi-lowcover").textContent = fmtNum(s.low_cover_skus);
   document.getElementById("kpi-dead").textContent = fmtNum(s.dead_stock_skus);
   document.getElementById("kpi-overstock").textContent = fmtNum(s.overstock_skus);
+  document.getElementById("kpi-legacy").textContent = fmtNum(s.legacy_skus);
 
   const { data: pb, error: pbErr } = await sb.rpc("fn_portal_brand_summary", { p_days: days });
   if (pbErr) { console.error(pbErr); return; }
@@ -128,11 +138,11 @@ async function loadDashboard() {
   const brandEntries = Object.entries(byBrand).sort((a, b) => b[1] - a[1]);
   charts.brand = horizontalBarChart("chart-brand", brandEntries.map(e => e[0]), brandEntries.map(e => e[1]), brandEntries.map(e => brandColor(e[0])), fmtINR);
 
-  const healthOrder = ["STOCKOUT", "LOW_COVER", "HEALTHY", "OVERSTOCK", "DEAD_STOCK", "DISCONTINUED_OUT"];
+  const healthOrder = ["STOCKOUT", "LOW_COVER", "HEALTHY", "OVERSTOCK", "DEAD_STOCK", "DISCONTINUED_OUT", "LEGACY_UNMAPPED"];
   const healthCounts = {
     STOCKOUT: s.stockout_skus, LOW_COVER: s.low_cover_skus, OVERSTOCK: s.overstock_skus, DEAD_STOCK: s.dead_stock_skus,
-    HEALTHY: s.total_skus - s.stockout_skus - s.low_cover_skus - s.overstock_skus - s.dead_stock_skus,
-    DISCONTINUED_OUT: 0,
+    DISCONTINUED_OUT: s.discontinued_out_skus, LEGACY_UNMAPPED: s.legacy_skus,
+    HEALTHY: s.total_skus - s.stockout_skus - s.low_cover_skus - s.overstock_skus - s.dead_stock_skus - s.discontinued_out_skus - s.legacy_skus,
   };
   const labels = healthOrder.map(k => HEALTH_LABEL[k]);
   const values = healthOrder.map(k => healthCounts[k] || 0);

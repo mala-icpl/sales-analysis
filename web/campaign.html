@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Portal Opportunity — Iconic Creation Inventory Dashboard</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="assets/config.js"></script>
+<script src="assets/supabase-client.js"></script>
+<script src="assets/charts.js"></script>
+<script src="assets/nav.js"></script>
+</head>
+<body>
+<div class="app-shell">
+  <nav class="sidebar" id="app-nav"></nav>
+  <main class="main">
+    <div class="page-header">
+      <div>
+        <h1>Portal Opportunity</h1>
+        <p>Find articles selling well elsewhere but not on a specific portal (or vice versa) — for campaign targeting.</p>
+      </div>
+    </div>
+
+    <div class="filter-row">
+      <label>Group by</label>
+      <select id="f-group">
+        <option value="article_color">Article + Colour</option>
+        <option value="article">Article</option>
+        <option value="sku">SKU</option>
+      </select>
+      <label>Focus portal</label>
+      <select id="f-portal">
+        <option value="Amazon">Amazon (incl. Cocoblu/Cloudtail)</option>
+        <option value="Myntra">Myntra</option>
+        <option value="Nykaa Fashion">Nykaa Fashion</option>
+        <option value="Nykaa.com">Nykaa.com</option>
+        <option value="Ajio">Ajio</option>
+        <option value="Flipkart">Flipkart</option>
+        <option value="Tata Cliq">Tata Cliq</option>
+        <option value="Own Website">Own Website</option>
+      </select>
+      <label>Brand</label>
+      <select id="f-brand"><option value="">All brands</option></select>
+      <input type="text" id="f-search" placeholder="Search article / colour…" style="width:220px">
+      <span class="text-muted" id="result-count" style="margin-left:auto"></span>
+    </div>
+
+    <div class="filter-row" id="period-row">
+      <label>Months to compare</label>
+      <span id="period-checks" class="text-muted">Loading available months…</span>
+    </div>
+
+    <div id="empty-state" class="empty-state" style="display:none">
+      No sales data yet. Head to <a href="upload.html">Upload Data</a> to bring in a monthly sales export.
+    </div>
+
+    <div id="content" style="display:none">
+      <div class="table-wrap">
+        <table>
+          <thead><tr id="table-head-row"></tr></thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+      <div class="filter-row" style="margin-top:14px">
+        <button class="btn secondary" id="prev-page">← Prev</button>
+        <span id="page-label" class="text-muted"></span>
+        <button class="btn secondary" id="next-page">Next →</button>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="assets/auth-guard.js"></script>
+<script>
+renderNav("campaign");
+
+const PAGE_SIZE = 100;
+let page = 0;
+let sortCol = null;   // e.g. "other::2026-07" or "group_key" — see sortValue()
+let sortAsc = false;
+let allPeriods = [];
+let selectedPeriods = [];
+let pivotRows = [];   // grouped, pivoted rows built from the long-format RPC result
+
+function currentGroup() { return document.getElementById("f-group").value; }
+function currentPortal() { return document.getElementById("f-portal").value; }
+
+async function populateBrandFilter() {
+  const { data } = await sb.rpc("fn_distinct_brands");
+  const sel = document.getElementById("f-brand");
+  (data || []).forEach(r => { const o = document.createElement("option"); o.value = r.brand; o.textContent = r.brand; sel.appendChild(o); });
+}
+
+async function loadPeriods() {
+  const { data, error } = await sb.rpc("fn_sales_by_period");
+  if (error) { console.error(error); return; }
+  allPeriods = [...new Set((data || []).map(r => r.period_key))].sort();
+  if (allPeriods.length === 0) {
+    document.getElementById("empty-state").style.display = "block";
+    document.getElementById("content").style.display = "none";
+    return;
+  }
+  document.getElementById("empty-state").style.display = "none";
+  document.getElementById("content").style.display = "block";
+  // default: last 2 uploaded months, oldest to newest
+  selectedPeriods = allPeriods.slice(-2);
+  renderPeriodChecks();
+}
+
+function renderPeriodChecks() {
+  const el = document.getElementById("period-checks");
+  el.innerHTML = allPeriods.map(p => `
+    <label style="margin-right:14px;font-weight:400;color:var(--text-primary)">
+      <input type="checkbox" class="period-check" value="${p}" ${selectedPeriods.includes(p) ? "checked" : ""}> ${p}
+    </label>
+  `).join("");
+  el.querySelectorAll(".period-check").forEach(cb => cb.addEventListener("change", () => {
+    selectedPeriods = [...el.querySelectorAll(".period-check:checked")].map(c => c.value).sort();
+    page = 0;
+    loadTable();
+  }));
+}
+
+function renderHead() {
+  const portal = currentPortal();
+  const g = currentGroup();
+  const groupLabel = g === "sku" ? "SKU" : (g === "article" ? "Article" : "Article + Colour");
+  const periodCols = selectedPeriods.map(p => `
+    <th data-sort="portal::${p}">${portal} — ${p}</th>
+    <th data-sort="other::${p}">Other portals — ${p}</th>
+  `).join("");
+  document.getElementById("table-head-row").innerHTML = `
+    <th data-sort="group_key">${groupLabel}</th>
+    <th data-sort="sku_count"># SKUs</th>
+    <th data-sort="brand">Brand</th>
+    <th data-sort="available_qty">Stock</th>
+    ${periodCols}
+    <th>Signal</th>
+  `;
+  document.querySelectorAll("th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const col = th.dataset.sort;
+      if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = false; }
+      renderRows();
+    });
+  });
+}
+
+function sortValue(row, col) {
+  if (!col) return 0;
+  if (col.startsWith("portal::")) return row.periods[col.slice(8)]?.portal_units ?? 0;
+  if (col.startsWith("other::")) return row.periods[col.slice(7)]?.other_units ?? 0;
+  return row[col] ?? 0;
+}
+
+function signalFor(row) {
+  const latest = selectedPeriods[selectedPeriods.length - 1];
+  const p = row.periods[latest];
+  if (!p) return `<span class="text-muted">—</span>`;
+  const portal = currentPortal();
+  if (p.other_units > 0 && p.portal_units === 0) {
+    return `<span class="badge badge-warning">Not on ${portal} yet</span>`;
+  }
+  if (p.portal_units > 0 && p.other_units === 0) {
+    return `<span class="badge badge-muted">${portal}-only</span>`;
+  }
+  if (p.other_units > p.portal_units * 3 && p.other_units >= 5) {
+    return `<span class="badge badge-serious">Underweight on ${portal}</span>`;
+  }
+  return `<span class="text-muted">—</span>`;
+}
+
+async function loadTable() {
+  if (selectedPeriods.length === 0) {
+    pivotRows = [];
+    renderRows();
+    return;
+  }
+  const group = currentGroup();
+  const portal = currentPortal();
+  const { data, error } = await sb.rpc("fn_portal_opportunity", { p_group: group, p_portal: portal, p_periods: selectedPeriods });
+  if (error) { console.error(error); document.getElementById("table-body").innerHTML = `<tr><td>Error: ${error.message}</td></tr>`; return; }
+
+  // pivot the long-format rows (one per group per period) into one row per group
+  const byGroup = {};
+  (data || []).forEach(r => {
+    if (!byGroup[r.group_key]) {
+      byGroup[r.group_key] = { group_key: r.group_key, brand: r.brand, sku_count: r.sku_count, available_qty: Number(r.available_qty || 0), periods: {} };
+    }
+    byGroup[r.group_key].periods[r.period_key] = { portal_units: Number(r.portal_units || 0), other_units: Number(r.other_units || 0) };
+  });
+  pivotRows = Object.values(byGroup);
+  renderHead();
+  renderRows();
+}
+
+function renderRows() {
+  const brand = document.getElementById("f-brand").value;
+  const search = document.getElementById("f-search").value.trim().toLowerCase();
+  let rows = pivotRows.filter(r =>
+    (!brand || r.brand === brand) &&
+    (!search || r.group_key.toLowerCase().includes(search))
+  );
+
+  if (sortCol) {
+    rows = [...rows].sort((a, b) => (sortValue(a, sortCol) - sortValue(b, sortCol)) * (sortAsc ? 1 : -1));
+  } else {
+    // default: biggest "other portals" activity in the latest period first
+    const latest = selectedPeriods[selectedPeriods.length - 1];
+    rows = [...rows].sort((a, b) => (b.periods[latest]?.other_units ?? 0) - (a.periods[latest]?.other_units ?? 0));
+  }
+
+  document.getElementById("result-count").textContent = `${rows.length.toLocaleString("en-IN")} groups`;
+  const pageRows = rows.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+  document.getElementById("page-label").textContent = `Page ${page + 1}${rows.length ? " of " + Math.ceil(rows.length / PAGE_SIZE) : ""}`;
+
+  const portal = currentPortal();
+  document.getElementById("table-body").innerHTML = pageRows.map(r => {
+    const periodCells = selectedPeriods.map(p => {
+      const v = r.periods[p] || { portal_units: 0, other_units: 0 };
+      return `<td>${fmtNum(v.portal_units)}</td><td>${fmtNum(v.other_units)}</td>`;
+    }).join("");
+    return `
+      <tr>
+        <td class="mono">${r.group_key}</td>
+        <td>${r.sku_count}</td>
+        <td>${r.brand || "—"}</td>
+        <td>${fmtNum(r.available_qty)}</td>
+        ${periodCells}
+        <td>${signalFor(r)}</td>
+      </tr>`;
+  }).join("") || `<tr><td colspan="${5 + selectedPeriods.length * 2}" class="empty-state">No matching rows.</td></tr>`;
+}
+
+["f-group", "f-portal"].forEach(id => document.getElementById(id).addEventListener("change", () => { page = 0; sortCol = null; loadTable(); }));
+["f-brand"].forEach(id => document.getElementById(id).addEventListener("change", () => { page = 0; renderRows(); }));
+let searchTimer;
+document.getElementById("f-search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { page = 0; renderRows(); }, 350); });
+document.getElementById("prev-page").addEventListener("click", () => { if (page > 0) { page--; renderRows(); } });
+document.getElementById("next-page").addEventListener("click", () => { page++; renderRows(); });
+
+(async function init() {
+  await populateBrandFilter();
+  await loadPeriods();
+  if (allPeriods.length > 0) await loadTable();
+})();
+</script>
+</body>
+</html>

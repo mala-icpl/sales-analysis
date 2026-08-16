@@ -87,6 +87,28 @@
           </div>
         </div>
       </div>
+
+      <div class="card">
+        <h2>Compare periods</h2>
+        <p class="card-sub">Pick any two uploaded months — e.g. this month vs last month, or the same month a year apart.</p>
+        <div class="filter-row">
+          <label>Period A</label>
+          <select id="cmp-a"></select>
+          <label>Period B</label>
+          <select id="cmp-b"></select>
+        </div>
+        <div class="kpi-row" id="cmp-kpi-row"></div>
+        <div class="chart-grid">
+          <div>
+            <h3 class="card-sub" style="margin-top:16px">Revenue by portal</h3>
+            <div style="height:260px"><canvas id="chart-cmp-portal"></canvas></div>
+          </div>
+          <div>
+            <h3 class="card-sub" style="margin-top:16px">Revenue by brand</h3>
+            <div style="height:260px"><canvas id="chart-cmp-brand"></canvas></div>
+          </div>
+        </div>
+      </div>
     </div>
   </main>
 </div>
@@ -200,7 +222,9 @@ async function loadPage() {
   const brandSel = document.getElementById("f-brand");
   brands.forEach(b => { const o = document.createElement("option"); o.value = b; o.textContent = b; brandSel.appendChild(o); });
 
+  populateCompareSelects(periods);
   refresh();
+  renderComparePeriods();
 }
 
 function refresh() {
@@ -221,7 +245,92 @@ function filteredRows_forTrend() {
   return allRows.filter(r => (!portal || r.portal === portal) && (!brand || r.brand === brand));
 }
 
+// ---------------------------------------------------------------------------
+// Compare periods (e.g. this month vs last month, or year-over-year)
+// ---------------------------------------------------------------------------
+let cmpCharts = {};
+function destroyCmpCharts() { Object.values(cmpCharts).forEach(c => c && c.destroy()); cmpCharts = {}; }
+
+function populateCompareSelects(periods) {
+  const aSel = document.getElementById("cmp-a");
+  const bSel = document.getElementById("cmp-b");
+  [aSel, bSel].forEach(sel => {
+    sel.innerHTML = "";
+    periods.forEach(p => { const o = document.createElement("option"); o.value = p; o.textContent = p; sel.appendChild(o); });
+  });
+  const latest = periods[periods.length - 1];
+  // Prefer same-month-last-year for Period A if it's been uploaded; else the
+  // month right before the latest one.
+  const yoy = latest ? (Number(latest.slice(0, 4)) - 1) + latest.slice(4) : null;
+  if (yoy && periods.includes(yoy)) {
+    aSel.value = yoy;
+  } else if (periods.length > 1) {
+    aSel.value = periods[periods.length - 2];
+  }
+  bSel.value = latest;
+}
+
+function periodAggregate(periodKey) {
+  const rows = allRows.filter(r => r.period_key === periodKey);
+  const agg = { revenue: 0, units: 0, returned: 0, orders: 0, byPortal: {}, byBrand: {} };
+  rows.forEach(r => {
+    agg.revenue += Number(r.net_revenue || 0);
+    agg.units += Number(r.units_sold || 0);
+    agg.returned += Number(r.units_returned || 0);
+    agg.orders += Number(r.orders || 0);
+    agg.byPortal[r.portal] = (agg.byPortal[r.portal] || 0) + Number(r.net_revenue || 0);
+    agg.byBrand[r.brand] = (agg.byBrand[r.brand] || 0) + Number(r.net_revenue || 0);
+  });
+  return agg;
+}
+
+// higherIsBetter=false inverts the good/bad coloring (e.g. return rate).
+function deltaTile(label, a, b, formatter, higherIsBetter = true) {
+  const pct = a !== 0 ? ((b - a) / Math.abs(a)) * 100 : (b !== 0 ? null : 0);
+  const improved = pct === null ? null : (higherIsBetter ? pct >= 0 : pct <= 0);
+  const arrow = pct === null ? "" : (pct >= 0 ? "▲" : "▼");
+  const colorVar = improved === null ? "var(--text-muted)" : (improved ? "var(--status-good)" : "var(--status-critical)");
+  const pctText = pct === null ? "new" : `${arrow} ${Math.abs(pct).toFixed(1)}%`;
+  return `
+    <div class="kpi-tile">
+      <div class="kpi-label">${label}</div>
+      <div class="kpi-value">${formatter(b)}</div>
+      <div class="kpi-sub">${formatter(a)} → <span style="color:${colorVar};font-weight:600">${pctText}</span></div>
+    </div>`;
+}
+
+function renderComparePeriods() {
+  const pA = document.getElementById("cmp-a").value;
+  const pB = document.getElementById("cmp-b").value;
+  if (!pA || !pB) return;
+  const a = periodAggregate(pA);
+  const b = periodAggregate(pB);
+
+  document.getElementById("cmp-kpi-row").innerHTML = [
+    deltaTile("Net revenue", a.revenue, b.revenue, fmtINR),
+    deltaTile("Units sold", a.units, b.units, fmtNum),
+    deltaTile("Units returned", a.returned, b.returned, fmtNum, false),
+    deltaTile("Return rate", (a.units + a.returned) ? 100 * a.returned / (a.units + a.returned) : 0,
+                              (b.units + b.returned) ? 100 * b.returned / (b.units + b.returned) : 0,
+                              (v) => v.toFixed(1) + "%", false),
+    deltaTile("Orders", a.orders, b.orders, fmtNum),
+    deltaTile("Avg order value", a.orders ? a.revenue / a.orders : 0, b.orders ? b.revenue / b.orders : 0, fmtINR),
+  ].join("");
+
+  destroyCmpCharts();
+  const portals = [...new Set([...Object.keys(a.byPortal), ...Object.keys(b.byPortal)])]
+    .sort((x, y) => (b.byPortal[y] || 0) - (b.byPortal[x] || 0));
+  cmpCharts.portal = groupedBarChart("chart-cmp-portal", portals,
+    portals.map(p => a.byPortal[p] || 0), portals.map(p => b.byPortal[p] || 0), pA, pB, fmtINR);
+
+  const brands = [...new Set([...Object.keys(a.byBrand), ...Object.keys(b.byBrand)])]
+    .sort((x, y) => (b.byBrand[y] || 0) - (b.byBrand[x] || 0));
+  cmpCharts.brand = groupedBarChart("chart-cmp-brand", brands,
+    brands.map(x => a.byBrand[x] || 0), brands.map(x => b.byBrand[x] || 0), pA, pB, fmtINR);
+}
+
 ["f-period", "f-portal", "f-brand"].forEach(id => document.getElementById(id).addEventListener("change", refresh));
+["cmp-a", "cmp-b"].forEach(id => document.getElementById(id).addEventListener("change", renderComparePeriods));
 loadPage();
 </script>
 </body>

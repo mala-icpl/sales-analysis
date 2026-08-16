@@ -24,6 +24,15 @@
       </div>
     </div>
 
+    <div class="empty-state" style="text-align:left;background:rgba(250,178,25,0.10);border:1px solid rgba(250,178,25,0.35);border-radius:var(--radius);padding:14px 18px;margin-bottom:18px">
+      <strong>Important — order matters.</strong> SKU matching for Inventory and Sales happens once,
+      at the moment you upload each file, against whatever is in SKU Master <em>right then</em>.
+      If you upload Sales or Inventory before SKU Master (or before an updated SKU Master), those
+      rows will stay unmatched even after you fix Master later — <strong>re-upload Sales/Inventory
+      again after SKU Master is correct</strong> to pick up the fix. There's no need to re-upload
+      SKU Master itself more than once, just Sales/Inventory files uploaded before it was ready.
+    </div>
+
     <div class="card">
       <h2>1 · SKU Master</h2>
       <p class="card-sub">The Article → EAN → portal-ID bridge file. Re-uploading updates existing SKUs and adds new ones (nothing is deleted).</p>
@@ -34,6 +43,14 @@
       <button class="btn" id="btn-master" disabled>Import SKU Master</button>
       <div class="progress-bar" id="progress-master" style="display:none"><div></div></div>
       <div id="log-master"></div>
+      <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--gridline)">
+        <p class="card-sub" style="margin-top:0">
+          This dashboard keeps its own copy of your SKU Master — independent of Vinclum. Download it
+          any time as a backup, or to edit and re-upload (same column layout as the original file).
+        </p>
+        <button class="btn secondary" id="btn-download-master">Download current SKU Master (.xlsx)</button>
+        <span class="text-muted" id="download-master-status" style="margin-left:10px"></span>
+      </div>
     </div>
 
     <div class="card">
@@ -115,7 +132,12 @@ async function parseSheetWithMarker(file, sheetIndexOrName, markerCell) {
   const wb = XLSX.read(buf, { type: "array" });
   const sheetName = typeof sheetIndexOrName === "number" ? wb.SheetNames[sheetIndexOrName] : sheetIndexOrName;
   const sheet = wb.Sheets[sheetName];
-  const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, blankrows: false });
+  // IMPORTANT: no `blankrows: false` here — that option drops blank rows
+  // from the returned array, which shifts array indices out of sync with
+  // real sheet row numbers. Since `range` below is a real sheet row number,
+  // the indices must line up, or this silently finds nothing and every
+  // downstream row gets skipped.
+  const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
   let headerRow = 0;
   for (let i = 0; i < Math.min(raw.length, 5); i++) {
     if (raw[i] && raw[i].includes(markerCell)) { headerRow = i; break; }
@@ -164,6 +186,71 @@ async function logUpload(fields) {
   loadUploadLog();
 }
 
+// ---- Download current SKU Master (independent of Vinclum) -----------------
+async function downloadCurrentMaster() {
+  const statusEl = document.getElementById("download-master-status");
+  const btn = document.getElementById("btn-download-master");
+  btn.disabled = true;
+  statusEl.textContent = "Loading…";
+  try {
+    const cols = "article,article_color,color,vinculum_sku,ean,myntra_style_id,asin,fsn,jio_code,nykaa_product_id,item_type_name,myntra_item_type,mrp,brand,article_status";
+    let rows = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data, error } = await sb.from("sku_master").select(cols).range(from, from + pageSize - 1).order("vinculum_sku");
+      if (error) throw error;
+      rows = rows.concat(data || []);
+      statusEl.textContent = `Loaded ${rows.length} rows…`;
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    if (rows.length === 0) {
+      statusEl.textContent = "SKU Master is empty — nothing to download yet.";
+      return;
+    }
+    // Column names matched to the original Vinclum export layout, so this
+    // file can be edited and re-uploaded through the same importer.
+    const exportRows = rows.map(r => ({
+      "Article": r.article,
+      "Article color": r.article_color,
+      "Color": r.color,
+      "Vinculum SKU": r.vinculum_sku,
+      "EAN": r.ean,
+      "Myntra styl id": r.myntra_style_id,
+      "Asin": r.asin,
+      "FSN": r.fsn,
+      "Jio Code": r.jio_code,
+      "Nykaa Product Id": r.nykaa_product_id,
+      "Item type Name": r.item_type_name,
+      "Myntra item type": r.myntra_item_type,
+      "MRP": r.mrp,
+      "Brand": r.brand,
+      "article Status": r.article_status,
+    }));
+    const ws = XLSX.utils.json_to_sheet(exportRows);
+    // Force EAN column to Text format so it never round-trips into
+    // scientific notation if this file is later reopened/re-saved in Excel.
+    const eanColIndex = 4; // "EAN" is the 5th column above (0-indexed)
+    const range = XLSX.utils.decode_range(ws["!ref"]);
+    for (let r = range.s.r + 1; r <= range.e.r; r++) {
+      const addr = XLSX.utils.encode_cell({ r, c: eanColIndex });
+      if (ws[addr]) { ws[addr].t = "s"; ws[addr].z = "@"; }
+    }
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "SKU Master");
+    const dateStr = new Date().toISOString().slice(0, 10);
+    XLSX.writeFile(wb, `sku_master_${dateStr}.xlsx`);
+    statusEl.textContent = `Downloaded ${rows.length} SKUs.`;
+  } catch (e) {
+    statusEl.textContent = "Failed: " + e.message;
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById("btn-download-master").addEventListener("click", downloadCurrentMaster);
+
 // ---- 1. SKU MASTER ----------------------------------------------------
 document.getElementById("file-master").addEventListener("change", () => {
   document.getElementById("btn-master").disabled = !document.getElementById("file-master").files.length;
@@ -178,8 +265,10 @@ document.getElementById("btn-master").addEventListener("click", async () => {
     log(logId, "Parsing " + file.name + "…");
     const raw = await parseSheetWithMarker(file, 0, "Vinculum SKU");
     log(logId, `Found ${raw.length} rows.`);
+    if (raw.length === 0) throw new Error("Found 0 rows in the file — the header row (\"Vinculum SKU\" etc.) wasn't detected. Check this is the right file/sheet.");
     const { rows } = window.Importers.normalizeMaster(raw);
     log(logId, `Normalized ${rows.length} SKUs. Upserting…`);
+    if (rows.length === 0) throw new Error("0 of " + raw.length + " rows had a usable \"Vinculum SKU\" value — check the file's column headers match what's expected.");
     // de-dupe within this file (last occurrence wins) so ON CONFLICT never
     // sees the same key twice in one batch, which Postgres upsert rejects.
     const deduped = [...new Map(rows.map(r => [r.vinculum_sku, r])).values()];
@@ -212,6 +301,8 @@ document.getElementById("btn-inventory").addEventListener("click", async () => {
     log(logId, "Parsing " + file.name + "…");
     const raw = await parseSheetSimple(file);
     log(logId, `Found ${raw.length} rows.`);
+    if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file.");
+    if (skuSet.size === 0) log(logId, "Warning: SKU Master is empty — every row will show as unmatched until you upload it.");
     const rows = window.Importers.normalizeInventory(raw, skuSet, snapshotDate, file.name, warehouse);
     const matched = rows.filter(r => r.matched).length;
     log(logId, `Normalized ${rows.length} rows (${matched} matched master, ${rows.length - matched} legacy/unmapped).`);
@@ -245,6 +336,8 @@ document.getElementById("btn-sales").addEventListener("click", async () => {
     log(logId, "Parsing " + file.name + "…");
     const raw = await parseSheetSimple(file);
     log(logId, `Found ${raw.length} rows.`);
+    if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file/sheet.");
+    if (eanToSku.size === 0) log(logId, "Warning: SKU Master is empty — every row will show as unmatched until you upload it.");
     const rows = window.Importers.normalizeSales(raw, eanToSku);
     const matched = rows.filter(r => r.matched).length;
     const periods = [...new Set(rows.map(r => r.period_key).filter(Boolean))];

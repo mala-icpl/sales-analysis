@@ -18,11 +18,16 @@
     <div class="page-header">
       <div>
         <h1>Inventory Health</h1>
-        <p>Every SKU's stock cover, sell-through, and health flag — single stock pool (not portal-specific).</p>
+        <p>Stock cover, sell-through, and health flag — combined stock across both warehouses (not portal-specific).</p>
       </div>
     </div>
 
     <div class="filter-row">
+      <label>Group by</label>
+      <select id="f-group">
+        <option value="article_color">Article + Colour</option>
+        <option value="article">Article</option>
+      </select>
       <label>Window</label>
       <select id="f-days">
         <option value="30">Trailing 30 days</option>
@@ -40,24 +45,17 @@
         <option value="OVERSTOCK">Overstock</option>
         <option value="DEAD_STOCK">Dead stock</option>
         <option value="DISCONTINUED_OUT">Discontinued (sold out)</option>
+        <option value="LEGACY_UNMAPPED">Legacy / not in master</option>
       </select>
-      <input type="text" id="f-search" placeholder="Search SKU / article…" style="width:220px">
+      <input type="text" id="f-search" placeholder="Search article / colour…" style="width:220px">
       <span class="text-muted" id="result-count" style="margin-left:auto"></span>
     </div>
 
     <div class="table-wrap">
       <table>
         <thead>
-          <tr>
-            <th data-sort="vinculum_sku">SKU</th>
-            <th data-sort="brand">Brand</th>
-            <th data-sort="article_status">Status</th>
-            <th data-sort="available_qty">Stock</th>
-            <th data-sort="units_sold">Sold (window)</th>
-            <th data-sort="daily_velocity">Daily velocity</th>
-            <th data-sort="stock_cover_days">Cover (days)</th>
-            <th data-sort="sell_through_rate">Sell-through</th>
-            <th data-sort="health_flag">Health</th>
+          <tr id="table-head-row">
+            <!-- filled in by renderHead() since column 1 depends on grouping -->
           </tr>
         </thead>
         <tbody id="table-body"></tbody>
@@ -81,10 +79,40 @@ let sortAsc = true;
 
 const params = new URLSearchParams(window.location.search);
 if (params.get("flag")) document.getElementById("f-flag").value = params.get("flag");
+if (params.get("group")) document.getElementById("f-group").value = params.get("group");
 
 function badgeFor(flag) {
-  const map = { STOCKOUT: "critical", LOW_COVER: "warning", OVERSTOCK: "serious", DEAD_STOCK: "muted", DISCONTINUED_OUT: "muted", HEALTHY: "good" };
+  const map = { STOCKOUT: "critical", LOW_COVER: "warning", OVERSTOCK: "serious", DEAD_STOCK: "muted", DISCONTINUED_OUT: "muted", LEGACY_UNMAPPED: "muted", HEALTHY: "good" };
   return `<span class="badge badge-${map[flag] || "muted"}">${HEALTH_LABEL[flag] || flag}</span>`;
+}
+
+function currentGroup() {
+  return document.getElementById("f-group").value; // "article_color" | "article"
+}
+
+function renderHead() {
+  const g = currentGroup();
+  const groupLabel = g === "article" ? "Article" : "Article + Colour";
+  document.getElementById("table-head-row").innerHTML = `
+    <th data-sort="group_key">${groupLabel}</th>
+    <th data-sort="sku_count"># SKUs</th>
+    <th data-sort="brand">Brand</th>
+    <th data-sort="article_status">Status</th>
+    <th data-sort="available_qty">Stock</th>
+    <th data-sort="units_sold">Sold (window)</th>
+    <th data-sort="daily_velocity">Daily velocity</th>
+    <th data-sort="stock_cover_days">Cover (days)</th>
+    <th data-sort="sell_through_rate">Sell-through</th>
+    <th data-sort="health_flag">Health</th>
+  `;
+  document.querySelectorAll("th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const col = th.dataset.sort;
+      if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = true; }
+      page = 0;
+      loadTable();
+    });
+  });
 }
 
 async function populateBrandFilter() {
@@ -95,26 +123,28 @@ async function populateBrandFilter() {
 
 async function loadTable() {
   const days = Number(document.getElementById("f-days").value);
+  const group = currentGroup();
   const brand = document.getElementById("f-brand").value;
   const flag = document.getElementById("f-flag").value;
   const search = document.getElementById("f-search").value.trim();
 
-  let query = sb.rpc("fn_sku_health", { p_days: days }, { count: "exact" });
+  let query = sb.rpc("fn_inventory_health", { p_days: days, p_group: group }, { count: "exact" });
   if (brand) query = query.eq("brand", brand);
   if (flag) query = query.eq("health_flag", flag);
-  if (search) query = query.or(`vinculum_sku.ilike.%${search}%,article.ilike.%${search}%`);
+  if (search) query = query.or(`group_key.ilike.%${search}%,article.ilike.%${search}%,color.ilike.%${search}%`);
   query = query.order(sortCol, { ascending: sortAsc, nullsFirst: false });
   query = query.range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
 
   const { data, error, count } = await query;
-  if (error) { console.error(error); document.getElementById("table-body").innerHTML = `<tr><td colspan="9">Error: ${error.message}</td></tr>`; return; }
+  if (error) { console.error(error); document.getElementById("table-body").innerHTML = `<tr><td colspan="10">Error: ${error.message}</td></tr>`; return; }
 
-  document.getElementById("result-count").textContent = count != null ? `${count.toLocaleString("en-IN")} SKUs` : "";
+  document.getElementById("result-count").textContent = count != null ? `${count.toLocaleString("en-IN")} ${group === "article" ? "articles" : "article/colour groups"}` : "";
   document.getElementById("page-label").textContent = `Page ${page + 1}${count ? " of " + Math.ceil(count / PAGE_SIZE) : ""}`;
 
   document.getElementById("table-body").innerHTML = (data || []).map(r => `
     <tr>
-      <td class="mono">${r.vinculum_sku}</td>
+      <td class="mono">${r.group_key || "—"}</td>
+      <td>${r.sku_count ?? "—"}</td>
       <td>${r.brand || "—"}</td>
       <td class="text-muted">${r.article_status || "—"}</td>
       <td>${fmtNum(r.available_qty)}</td>
@@ -124,24 +154,19 @@ async function loadTable() {
       <td>${r.sell_through_rate != null ? (r.sell_through_rate * 100).toFixed(1) + "%" : "—"}</td>
       <td>${badgeFor(r.health_flag)}</td>
     </tr>
-  `).join("") || `<tr><td colspan="9" class="empty-state">No matching SKUs.</td></tr>`;
+  `).join("") || `<tr><td colspan="10" class="empty-state">No matching rows.</td></tr>`;
 }
 
-document.querySelectorAll("th[data-sort]").forEach(th => {
-  th.addEventListener("click", () => {
-    const col = th.dataset.sort;
-    if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = true; }
-    page = 0;
-    loadTable();
-  });
-});
-
+["f-group"].forEach(id => document.getElementById(id).addEventListener("change", () => {
+  sortCol = "stock_cover_days"; sortAsc = true; page = 0; renderHead(); loadTable();
+}));
 ["f-days", "f-brand", "f-flag"].forEach(id => document.getElementById(id).addEventListener("change", () => { page = 0; loadTable(); }));
 let searchTimer;
 document.getElementById("f-search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { page = 0; loadTable(); }, 350); });
 document.getElementById("prev-page").addEventListener("click", () => { if (page > 0) { page--; loadTable(); } });
 document.getElementById("next-page").addEventListener("click", () => { page++; loadTable(); });
 
+renderHead();
 populateBrandFilter();
 loadTable();
 </script>

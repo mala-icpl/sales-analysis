@@ -27,6 +27,7 @@ const HEALTH_COLOR = {
   OVERSTOCK: "#ec835a",
   DEAD_STOCK: "#898781",
   DISCONTINUED_OUT: "#c3c2b7",
+  LEGACY_UNMAPPED: "#898781",
 };
 const HEALTH_LABEL = {
   HEALTHY: "Healthy",
@@ -35,6 +36,7 @@ const HEALTH_LABEL = {
   OVERSTOCK: "Overstock",
   DEAD_STOCK: "Dead stock",
   DISCONTINUED_OUT: "Discontinued (sold out)",
+  LEGACY_UNMAPPED: "Legacy / not in master",
 };
 
 Chart.defaults.font.family = "system-ui, -apple-system, 'Segoe UI', sans-serif";
@@ -53,6 +55,49 @@ function fmtINR(n) {
 function fmtNum(n) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return Math.round(n).toLocaleString("en-IN");
+}
+
+// Fixed pair for period-vs-period comparisons (e.g. Jul'26 vs Aug'26, or
+// Jul'26 vs Jul'25). This is a 2-series identity ("Period A" / "Period B"),
+// not a portal/brand encoding, so it uses its own validated pair from the
+// categorical ramp (series-1 / series-2) rather than portal/brand colors —
+// keeps "Period A" always the same hue regardless of which two periods are
+// picked. Validated: node scripts/validate_palette.js "#2a78d6,#eb6834" — PASS.
+const COMPARE_COLOR_A = "#2a78d6";
+const COMPARE_COLOR_B = "#eb6834";
+
+// Two-series grouped bar for comparing two periods across categories
+// (portal or brand). labelA/labelB name the two periods in the legend.
+function groupedBarChart(canvasId, labels, valuesA, valuesB, labelA, labelB, valueFormatter) {
+  const ctx = document.getElementById(canvasId).getContext("2d");
+  return new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        { label: labelA, data: valuesA, backgroundColor: COMPARE_COLOR_A, borderRadius: 4, maxBarThickness: 26 },
+        { label: labelB, data: valuesB, backgroundColor: COMPARE_COLOR_B, borderRadius: 4, maxBarThickness: 26 },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: "top", align: "start", labels: { usePointStyle: true, boxWidth: 8 } },
+        tooltip: {
+          backgroundColor: "#0b0b0b",
+          padding: 10,
+          callbacks: {
+            label: (item) => `${item.dataset.label}: ${valueFormatter ? valueFormatter(item.raw) : item.raw}`,
+          },
+        },
+      },
+      scales: {
+        x: { grid: { display: false }, border: { display: false } },
+        y: { grid: { color: "#e1e0d9" }, border: { display: false }, ticks: { callback: (v) => valueFormatter ? valueFormatter(v) : v } },
+      },
+    },
+  });
 }
 
 function horizontalBarChart(canvasId, labels, values, colors, valueFormatter) {

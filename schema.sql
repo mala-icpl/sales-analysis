@@ -483,6 +483,119 @@ RETURNS TABLE (brand text) LANGUAGE sql STABLE SET search_path = public, pg_temp
   SELECT DISTINCT h.brand FROM fn_sku_health(30) h WHERE h.brand IS NOT NULL ORDER BY 1;
 $$;
 
+-- Per Article / Article+Colour / SKU, compares units sold on a chosen
+-- "focus" portal vs every other portal combined, across any number of
+-- selected calendar months — powers the Portal Opportunity page (campaign
+-- targeting: find articles doing well elsewhere but not on a given portal,
+-- or vice versa). Returns one row per group PER MONTH (long format, like
+-- fn_sales_by_period) so the page can pivot into as many month columns as
+-- the user picks, rather than a fixed number.
+CREATE OR REPLACE FUNCTION fn_portal_opportunity(
+  p_group    text DEFAULT 'article_color',   -- 'sku' | 'article_color' | 'article'
+  p_portal   text DEFAULT 'Amazon',
+  p_periods  text[] DEFAULT ARRAY[]::text[]
+)
+RETURNS TABLE (
+  group_key      text,
+  vinculum_sku   text,
+  article        text,
+  color          text,
+  sku_count      bigint,
+  brand          text,
+  available_qty  numeric,
+  period_key     text,
+  portal_units   numeric,
+  other_units    numeric
+) LANGUAGE plpgsql STABLE SET search_path = public, pg_temp AS $$
+BEGIN
+  IF p_group NOT IN ('sku', 'article_color', 'article') THEN
+    RAISE EXCEPTION 'invalid p_group: %, expected sku, article_color, or article', p_group;
+  END IF;
+
+  RETURN QUERY
+  WITH universe AS (
+    SELECT sm.vinculum_sku FROM sku_master sm
+    UNION
+    SELECT ci.vinculum_sku FROM v_current_inventory ci
+  ),
+  base AS (
+    SELECT
+      u.vinculum_sku,
+      COALESCE(m.article, split_part(u.vinculum_sku, '_', 1)) AS article,
+      COALESCE(m.color, split_part(u.vinculum_sku, '_', 2)) AS color,
+      COALESCE(m.brand, i.brand_code, 'Unmapped') AS brand,
+      COALESCE(i.available_qty, 0)::numeric AS available_qty
+    FROM universe u
+    LEFT JOIN sku_master m ON m.vinculum_sku = u.vinculum_sku
+    LEFT JOIN v_current_inventory i ON i.vinculum_sku = u.vinculum_sku
+  ),
+  sales_agg AS (
+    SELECT
+      s.vinculum_sku,
+      s.period_key,
+      SUM(CASE WHEN s.portal = p_portal THEN s.qty ELSE 0 END) AS portal_units,
+      SUM(CASE WHEN s.portal <> p_portal THEN s.qty ELSE 0 END) AS other_units
+    FROM sales s
+    WHERE s.vinculum_sku IS NOT NULL
+      AND s.status IN ('Shipped complete','delivered','Pick complete','Packed')
+      AND s.period_key = ANY(p_periods)
+    GROUP BY s.vinculum_sku, s.period_key
+  ),
+  -- every (SKU, requested period) combination, so months with 0 sales still
+  -- show up as a 0 column rather than being missing from the pivot
+  sku_x_period AS (
+    SELECT b.vinculum_sku, pk.period_key
+    FROM base b
+    CROSS JOIN unnest(p_periods) AS pk(period_key)
+  ),
+  joined AS (
+    SELECT
+      b.vinculum_sku, b.article, b.color, b.brand, b.available_qty,
+      sxp.period_key,
+      COALESCE(sa.portal_units, 0) AS portal_units,
+      COALESCE(sa.other_units, 0) AS other_units
+    FROM sku_x_period sxp
+    JOIN base b ON b.vinculum_sku = sxp.vinculum_sku
+    LEFT JOIN sales_agg sa ON sa.vinculum_sku = sxp.vinculum_sku AND sa.period_key = sxp.period_key
+  ),
+  -- keep a SKU only if it has stock, or sold something (on any portal) in
+  -- ANY of the requested periods — otherwise the pivot would be all zeros
+  relevant AS (
+    SELECT j.vinculum_sku FROM joined j
+    GROUP BY j.vinculum_sku
+    HAVING MAX(j.available_qty) > 0 OR SUM(j.portal_units + j.other_units) > 0
+  )
+  SELECT * FROM (
+    SELECT
+      j.vinculum_sku AS group_key, j.vinculum_sku, j.article, j.color, 1::bigint AS sku_count,
+      j.brand, j.available_qty, j.period_key, j.portal_units, j.other_units
+    FROM joined j
+    JOIN relevant r ON r.vinculum_sku = j.vinculum_sku
+    WHERE p_group = 'sku'
+
+    UNION ALL
+
+    SELECT
+      (COALESCE(j.article,'?') || ' / ' || COALESCE(j.color,'?')), NULL::text, j.article, j.color, COUNT(DISTINCT j.vinculum_sku)::bigint,
+      MAX(j.brand), SUM(j.available_qty), j.period_key, SUM(j.portal_units), SUM(j.other_units)
+    FROM joined j
+    JOIN relevant r ON r.vinculum_sku = j.vinculum_sku
+    WHERE p_group = 'article_color'
+    GROUP BY j.article, j.color, j.period_key
+
+    UNION ALL
+
+    SELECT
+      COALESCE(j.article,'?'), NULL::text, j.article, NULL::text, COUNT(DISTINCT j.vinculum_sku)::bigint,
+      MAX(j.brand), SUM(j.available_qty), j.period_key, SUM(j.portal_units), SUM(j.other_units)
+    FROM joined j
+    JOIN relevant r ON r.vinculum_sku = j.vinculum_sku
+    WHERE p_group = 'article'
+    GROUP BY j.article, j.period_key
+  ) result;
+END;
+$$;
+
 -- ----------------------------------------------------------------------------
 -- 6. ROW LEVEL SECURITY
 -- This is a private internal tool. Only authenticated (logged-in) users may

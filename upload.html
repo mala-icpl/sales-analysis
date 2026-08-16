@@ -24,6 +24,15 @@
       </div>
     </div>
 
+    <div class="empty-state" style="text-align:left;background:rgba(250,178,25,0.10);border:1px solid rgba(250,178,25,0.35);border-radius:var(--radius);padding:14px 18px;margin-bottom:18px">
+      <strong>Important — order matters.</strong> SKU matching for Inventory and Sales happens once,
+      at the moment you upload each file, against whatever is in SKU Master <em>right then</em>.
+      If you upload Sales or Inventory before SKU Master (or before an updated SKU Master), those
+      rows will stay unmatched even after you fix Master later — <strong>re-upload Sales/Inventory
+      again after SKU Master is correct</strong> to pick up the fix. There's no need to re-upload
+      SKU Master itself more than once, just Sales/Inventory files uploaded before it was ready.
+    </div>
+
     <div class="card">
       <h2>1 · SKU Master</h2>
       <p class="card-sub">The Article → EAN → portal-ID bridge file. Re-uploading updates existing SKUs and adds new ones (nothing is deleted).</p>

@@ -113,6 +113,23 @@ function setProgress(id, pct) {
   bar.style.display = "block";
   bar.firstElementChild.style.width = pct + "%";
 }
+// Lets the browser actually paint whatever was just logged before a heavy
+// synchronous block (like XLSX parsing) freezes the tab. Without this, a
+// log() call right before parseSheetRobust() never reaches the screen —
+// the tab locks up before the next paint, so it just looks dead instead of
+// showing "Parsing…" first. Also used to warn about large files up front,
+// since big multi-month exports can take a while to parse and Chrome may
+// show a "page isn't responding" prompt during that time — expected, not a
+// crash; clicking "Wait" lets it finish.
+function nextPaint() {
+  return new Promise(resolve => setTimeout(resolve, 30));
+}
+function warnIfLarge(file, logId) {
+  const mb = file.size / (1024 * 1024);
+  if (mb > 8) {
+    log(logId, `Large file (${mb.toFixed(1)} MB) — parsing may take a minute and your browser might show "page isn't responding" during that time. That's expected for a big file, not a crash — click "Wait" and let it finish.`);
+  }
+}
 
 // ---- File parsing (SheetJS handles xlsx AND csv) --------------------------
 function readFileAsArrayBuffer(file) {
@@ -158,7 +175,7 @@ async function parseSheetWithMarker(file, sheetIndexOrName, markerCell) {
   const wb = XLSX.read(buf, { type: "array" });
   const sheetName = typeof sheetIndexOrName === "number" ? wb.SheetNames[sheetIndexOrName] : sheetIndexOrName;
   const sheet = wb.Sheets[sheetName];
-  const found = findHeaderRow(sheet, markerCell, 5);
+  const found = findHeaderRow(sheet, markerCell, 15);
   return XLSX.utils.sheet_to_json(sheet, { range: found >= 0 ? found : 0, defval: null });
 }
 
@@ -176,7 +193,12 @@ async function parseSheetRobust(file, markerCell) {
   const wb = XLSX.read(buf, { type: "array" });
   for (const sheetName of wb.SheetNames) {
     const sheet = wb.Sheets[sheetName];
-    const headerRow = findHeaderRow(sheet, markerCell, 10);
+    // 60 rows, not 10 — some custom date-range exports stack several report/
+    // title rows above the real header (more than a normal single-month
+    // export does). The capped-range read in findHeaderRow makes a wider
+    // scan cheap regardless of file size, so there's no real cost to
+    // searching further before giving up.
+    const headerRow = findHeaderRow(sheet, markerCell, 60);
     if (headerRow >= 0) {
       return XLSX.utils.sheet_to_json(sheet, { range: headerRow, defval: null });
     }
@@ -297,6 +319,8 @@ document.getElementById("btn-master").addEventListener("click", async () => {
   try {
     const file = document.getElementById("file-master").files[0];
     log(logId, "Parsing " + file.name + "…");
+    warnIfLarge(file, logId);
+    await nextPaint();
     const raw = await parseSheetWithMarker(file, 0, "Vinculum SKU");
     log(logId, `Found ${raw.length} rows.`);
     if (raw.length === 0) throw new Error("Found 0 rows in the file — the header row (\"Vinculum SKU\" etc.) wasn't detected. Check this is the right file/sheet.");
@@ -333,6 +357,8 @@ document.getElementById("btn-inventory").addEventListener("click", async () => {
     if (!warehouse) { log(logId, "Enter a warehouse name first (e.g. ICWN) — needed so the two warehouses' stock adds up correctly instead of overwriting each other."); btn.disabled = false; return; }
     const { skuSet } = await fetchAllMasterIndex(logId);
     log(logId, "Parsing " + file.name + "…");
+    warnIfLarge(file, logId);
+    await nextPaint();
     const raw = await parseSheetRobust(file, "SKU Desc");
     log(logId, `Found ${raw.length} rows.`);
     if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file. If the file has multiple sheets/tabs, make sure one of them has a \"SKU Desc\" column.");
@@ -368,14 +394,26 @@ document.getElementById("btn-sales").addEventListener("click", async () => {
     const file = document.getElementById("file-sales").files[0];
     const { eanToSku } = await fetchAllMasterIndex(logId);
     log(logId, "Parsing " + file.name + "…");
+    warnIfLarge(file, logId);
+    await nextPaint();
     const raw = await parseSheetRobust(file, "ClientSKU");
     log(logId, `Found ${raw.length} rows.`);
     if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file/sheet. If the file has multiple sheets/tabs (e.g. a summary tab plus a data tab), make sure one of them has a \"ClientSKU\" column.");
     if (eanToSku.size === 0) log(logId, "Warning: SKU Master is empty — every row will show as unmatched until you upload it.");
-    const rows = window.Importers.normalizeSales(raw, eanToSku);
+    const { rows, skipped } = window.Importers.normalizeSales(raw, eanToSku);
     const matched = rows.filter(r => r.matched).length;
     const periods = [...new Set(rows.map(r => r.period_key).filter(Boolean))];
     log(logId, `Normalized ${rows.length} rows (${matched} matched, ${rows.length - matched} unmatched EAN). Periods found: ${periods.join(", ")}`);
+    if (skipped.length > 0) {
+      // A row with no usable invoice date can't be stored (period_key is
+      // required) — most likely an order that hasn't been invoiced yet.
+      // Skip it rather than fail the whole upload, but say so clearly
+      // rather than let the count silently vanish.
+      const byStatus = {};
+      skipped.forEach(s => { const k = s.status || "(no status)"; byStatus[k] = (byStatus[k] || 0) + 1; });
+      const breakdown = Object.entries(byStatus).map(([k, v]) => `${k}: ${v}`).join(", ");
+      log(logId, `Skipped ${skipped.length} row(s) with no usable invoice date — can't be filed under a month. Breakdown by status: ${breakdown}. These are most likely orders not yet invoiced; re-upload this same file later once they're invoiced and they'll be picked up then.`);
+    }
     if (periods.length > 1) {
       log(logId, "Note: this file spans more than one month — that's fine, each month's rows replace that month's existing data independently.");
     }

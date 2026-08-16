@@ -108,14 +108,32 @@
     return iso ? iso.slice(0, 7) : null;
   }
 
+  // `period_key` (the month a sale is filed under) is deliberately derived
+  // from Invoice Date, not Order Date — see schema notes. sales.period_key
+  // is NOT NULL in the database, so a row with no parseable invoice date
+  // can't be inserted at all. That's expected for orders that have been
+  // placed but not yet invoiced (still processing, pending, etc.) — a
+  // custom multi-month date-range export is more likely to catch some of
+  // these mid-flight than a normal single-month export, which is why this
+  // showed up now. Those rows are skipped (not force-fit into some
+  // approximate month) rather than crashing the whole import; the caller
+  // reports how many were skipped and why, so it's visible, not silent —
+  // re-uploading the same file later, once those orders are invoiced,
+  // picks them up automatically.
   function normalizeSales(rows, eanToSku) {
     const out = [];
+    const skipped = [];
     for (const r of rows) {
       const client_sku_ean = clean(r['ClientSKU']);
       const vinculum_sku = client_sku_ean && eanToSku ? eanToSku.get(client_sku_ean) || null : null;
       const { portal, entity, unit } = mapOrderChannel(r['Order Channel']);
       const order_date = parseVinclumDate(r['OrderDate']);
       const invoice_date = parseVinclumDate(r['DateofInvoice']);
+      const period_key = periodKeyFromDate(invoice_date);
+      if (!period_key) {
+        skipped.push({ status: clean(r['Status']), order_no: clean(r['OrderNo']), invoice_no: clean(r['InvoiceNo']) });
+        continue;
+      }
       out.push({
         client_sku_ean,
         vinculum_sku,
@@ -137,10 +155,10 @@
         order_no: clean(r['OrderNo']),
         external_order_no: clean(r['ExternalOrderNo']),
         source_warehouse: clean(r['SourceWarehouse']),
-        period_key: periodKeyFromDate(invoice_date),
+        period_key,
       });
     }
-    return out;
+    return { rows: out, skipped };
   }
 
   window.Importers = { normalizeMaster, normalizeInventory, normalizeSales, clean, toNum, parseVinclumDate };

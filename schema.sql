@@ -621,3 +621,74 @@ CREATE POLICY "authenticated read/write sales" ON sales
 DROP POLICY IF EXISTS "authenticated read/write upload_log" ON upload_log;
 CREATE POLICY "authenticated read/write upload_log" ON upload_log
   FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');
+
+-- ----------------------------------------------------------------------------
+-- 7. CATALOGUE MASTER
+-- Creative/listing data for building portal catalogues (title, category,
+-- material, heel type, etc.) — deliberately separate from sku_master so
+-- filling this in (slowly, article by article) can never affect
+-- inventory/sales matching. Keyed by vinculum_sku, same as everywhere else.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS catalogue_master (
+  vinculum_sku    text PRIMARY KEY,
+  article         text,
+  color           text,
+  brand           text,
+  vendor          text,
+  segment         text,       -- Girl / Boy / Women / Men / Unisex etc.
+  category        text,       -- e.g. Heels, Flats, Sneakers
+  age_group       text,       -- e.g. 6-6.5Y
+  euro_size       text,
+  uk_size         text,
+  us_size         text,
+  cm_size         text,
+  upper           text,       -- upper material, e.g. Synthetic
+  sole            text,
+  heel_height     text,       -- e.g. "1.5 Inches"
+  heel_type       text,       -- e.g. Block / Stiletto / Wedge / Flat
+  mrp             numeric,
+  hsn             text,
+  model_no        text,
+  item_name       text,       -- internal working name
+  display_name    text,       -- customer-facing listing title
+  ean             text,       -- barcode
+  asin            text,
+  notes           text,
+  -- spare fields for anything that comes up later, without needing a
+  -- schema change each time — use for whatever, rename their meaning
+  -- in your own head, they're exposed in the template/download/upload too.
+  custom_field_1  text,
+  custom_field_2  text,
+  custom_field_3  text,
+  updated_at      timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalogue_article  ON catalogue_master (article);
+CREATE INDEX IF NOT EXISTS idx_catalogue_brand     ON catalogue_master (brand);
+CREATE INDEX IF NOT EXISTS idx_catalogue_category  ON catalogue_master (category);
+
+ALTER TABLE catalogue_master ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "authenticated read/write catalogue_master" ON catalogue_master;
+CREATE POLICY "authenticated read/write catalogue_master" ON catalogue_master
+  FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');
+
+-- How many catalogue rows exist vs how many SKUs actually need one (i.e.
+-- SKUs in sku_master that don't yet have a matching catalogue_master row) —
+-- powers a small coverage stat on the Catalogue page.
+CREATE OR REPLACE FUNCTION fn_catalogue_coverage()
+RETURNS TABLE (
+  total_master_skus    bigint,
+  catalogued_skus      bigint,
+  uncatalogued_skus    bigint
+) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
+  SELECT
+    (SELECT COUNT(*) FROM sku_master),
+    (SELECT COUNT(*) FROM sku_master m WHERE EXISTS (SELECT 1 FROM catalogue_master c WHERE c.vinculum_sku = m.vinculum_sku)),
+    (SELECT COUNT(*) FROM sku_master m WHERE NOT EXISTS (SELECT 1 FROM catalogue_master c WHERE c.vinculum_sku = m.vinculum_sku));
+$$;
+
+CREATE OR REPLACE FUNCTION fn_distinct_categories()
+RETURNS TABLE (category text) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
+  SELECT DISTINCT c.category FROM catalogue_master c WHERE c.category IS NOT NULL ORDER BY 1;
+$$;

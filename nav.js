@@ -7,6 +7,7 @@ function renderNav(active) {
     { key: "inventory", href: "inventory.html", label: "Inventory Health" },
     { key: "sales", href: "sales.html", label: "Sales Analysis" },
     { key: "campaign", href: "campaign.html", label: "Portal Opportunity" },
+    { key: "catalogue", href: "catalogue.html", label: "Catalogue" },
     { key: "upload", href: "upload.html", label: "Upload Data" },
   ];
   const el = document.getElementById("app-nav");

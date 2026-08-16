@@ -152,7 +152,7 @@ function donutChart(canvasId, labels, values, colors) {
   });
 }
 
-function lineChart(canvasId, labels, datasets) {
+function lineChart(canvasId, labels, datasets, valueFormatter) {
   const ctx = document.getElementById(canvasId).getContext("2d");
   return new Chart(ctx, {
     type: "line",
@@ -174,11 +174,17 @@ function lineChart(canvasId, labels, datasets) {
       maintainAspectRatio: false,
       plugins: {
         legend: { position: "bottom", labels: { usePointStyle: true, boxWidth: 8 } },
-        tooltip: { backgroundColor: "#0b0b0b", padding: 10 },
+        tooltip: {
+          backgroundColor: "#0b0b0b",
+          padding: 10,
+          callbacks: {
+            label: (item) => `${item.dataset.label}: ${valueFormatter ? valueFormatter(item.raw) : item.raw}`,
+          },
+        },
       },
       scales: {
         x: { grid: { display: false }, border: { display: false } },
-        y: { grid: { color: "#e1e0d9" }, border: { display: false } },
+        y: { grid: { color: "#e1e0d9" }, border: { display: false }, ticks: { callback: (v) => valueFormatter ? valueFormatter(v) : v } },
       },
     },
   });

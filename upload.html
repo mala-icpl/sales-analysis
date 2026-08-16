@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Upload Data — Iconic Creation Inventory Dashboard</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="assets/config.js"></script>
+<script src="assets/supabase-client.js"></script>
+<script src="assets/portal-map.js"></script>
+<script src="assets/importers.js"></script>
+<script src="assets/nav.js"></script>
+</head>
+<body>
+<div class="app-shell">
+  <nav class="sidebar" id="app-nav"></nav>
+  <main class="main">
+    <div class="page-header">
+      <div>
+        <h1>Upload Data</h1>
+        <p>Bring in exports from Vinclum. Upload the SKU Master first (the other two join against it).</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>1 · SKU Master</h2>
+      <p class="card-sub">The Article → EAN → portal-ID bridge file. Re-uploading updates existing SKUs and adds new ones (nothing is deleted).</p>
+      <div class="upload-box">
+        <div>Drop or choose the master Excel file (e.g. "all sku master with id's.xlsx")</div>
+        <input type="file" id="file-master" accept=".xlsx,.xls,.csv">
+      </div>
+      <button class="btn" id="btn-master" disabled>Import SKU Master</button>
+      <div class="progress-bar" id="progress-master" style="display:none"><div></div></div>
+      <div id="log-master"></div>
+    </div>
+
+    <div class="card">
+      <h2>2 · Inventory Snapshot</h2>
+      <p class="card-sub">Today's stock export from one warehouse. Upload each warehouse separately (same date is fine) — the dashboard combines them automatically. Re-uploading the same date + warehouse replaces just that snapshot.</p>
+      <div class="filter-row">
+        <label>Warehouse</label>
+        <input type="text" id="inv-warehouse" list="warehouse-list" placeholder="e.g. ICWN" style="width:140px">
+        <datalist id="warehouse-list"></datalist>
+        <label>Snapshot date</label>
+        <input type="date" id="inv-date">
+      </div>
+      <div class="upload-box">
+        <div>Drop or choose the inventory CSV/Excel file</div>
+        <input type="file" id="file-inventory" accept=".xlsx,.xls,.csv">
+      </div>
+      <button class="btn" id="btn-inventory" disabled>Import Inventory</button>
+      <div class="progress-bar" id="progress-inventory" style="display:none"><div></div></div>
+      <div id="log-inventory"></div>
+    </div>
+
+    <div class="card">
+      <h2>3 · Sales</h2>
+      <p class="card-sub">Monthly sales export. The month is detected automatically from the invoice date — re-uploading a month replaces that month's rows, so it's safe to re-pull.</p>
+      <div class="upload-box">
+        <div>Drop or choose the sales Excel file</div>
+        <input type="file" id="file-sales" accept=".xlsx,.xls,.csv">
+      </div>
+      <button class="btn" id="btn-sales" disabled>Import Sales</button>
+      <div class="progress-bar" id="progress-sales" style="display:none"><div></div></div>
+      <div id="log-sales"></div>
+    </div>
+
+    <div class="card">
+      <h2>Recent uploads</h2>
+      <div class="table-wrap" style="max-height:260px">
+        <table>
+          <thead><tr><th>When</th><th>Type</th><th>File</th><th>Rows</th><th>Matched</th><th>Unmatched</th><th>Notes</th></tr></thead>
+          <tbody id="log-table"></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="assets/auth-guard.js"></script>
+<script>
+renderNav("upload");
+document.getElementById("inv-date").value = new Date().toISOString().slice(0, 10);
+
+function log(id, msg) {
+  const el = document.getElementById(id);
+  const line = document.createElement("div");
+  line.className = "log-line";
+  line.textContent = msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+function setProgress(id, pct) {
+  const bar = document.getElementById(id);
+  bar.style.display = "block";
+  bar.firstElementChild.style.width = pct + "%";
+}
+
+// ---- File parsing (SheetJS handles xlsx AND csv) --------------------------
+function readFileAsArrayBuffer(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// Finds the row that actually contains the header, by looking for a marker
+// cell (e.g. "Vinculum SKU"), then parses from there. Handles Vinclum's
+// SKU Master export having a blank first row above the real header.
+async function parseSheetWithMarker(file, sheetIndexOrName, markerCell) {
+  const buf = await readFileAsArrayBuffer(file);
+  const wb = XLSX.read(buf, { type: "array" });
+  const sheetName = typeof sheetIndexOrName === "number" ? wb.SheetNames[sheetIndexOrName] : sheetIndexOrName;
+  const sheet = wb.Sheets[sheetName];
+  // IMPORTANT: no `blankrows: false` here — that option drops blank rows
+  // from the returned array, which shifts array indices out of sync with
+  // real sheet row numbers. Since `range` below is a real sheet row number,
+  // the indices must line up, or this silently finds nothing and every
+  // downstream row gets skipped.
+  const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+  let headerRow = 0;
+  for (let i = 0; i < Math.min(raw.length, 5); i++) {
+    if (raw[i] && raw[i].includes(markerCell)) { headerRow = i; break; }
+  }
+  return XLSX.utils.sheet_to_json(sheet, { range: headerRow, defval: null });
+}
+
+async function parseSheetSimple(file) {
+  const buf = await readFileAsArrayBuffer(file);
+  const wb = XLSX.read(buf, { type: "array" });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(sheet, { defval: null });
+}
+
+// ---- Batch upsert/insert helper -------------------------------------------
+async function chunkedUpsert(table, rows, onConflict, progressId, logId, chunkSize = 500) {
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    const { error } = onConflict
+      ? await sb.from(table).upsert(chunk, { onConflict })
+      : await sb.from(table).insert(chunk);
+    if (error) { log(logId, "ERROR at row " + i + ": " + error.message); throw error; }
+    setProgress(progressId, Math.min(100, Math.round(((i + chunk.length) / rows.length) * 100)));
+  }
+}
+
+async function fetchAllMasterIndex(logId) {
+  log(logId, "Loading current SKU master for matching…");
+  const eanToSku = new Map();
+  const skuSet = new Set();
+  let from = 0;
+  const pageSize = 1000;
+  while (true) {
+    const { data, error } = await sb.from("sku_master").select("vinculum_sku, ean").range(from, from + pageSize - 1);
+    if (error) throw error;
+    (data || []).forEach(r => { skuSet.add(r.vinculum_sku); if (r.ean) eanToSku.set(r.ean, r.vinculum_sku); });
+    if (!data || data.length < pageSize) break;
+    from += pageSize;
+  }
+  log(logId, `Loaded ${skuSet.size} master SKUs.`);
+  return { eanToSku, skuSet };
+}
+
+async function logUpload(fields) {
+  await sb.from("upload_log").insert(fields);
+  loadUploadLog();
+}
+
+// ---- 1. SKU MASTER ----------------------------------------------------
+document.getElementById("file-master").addEventListener("change", () => {
+  document.getElementById("btn-master").disabled = !document.getElementById("file-master").files.length;
+});
+document.getElementById("btn-master").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-master");
+  const logId = "log-master";
+  document.getElementById(logId).innerHTML = "";
+  btn.disabled = true;
+  try {
+    const file = document.getElementById("file-master").files[0];
+    log(logId, "Parsing " + file.name + "…");
+    const raw = await parseSheetWithMarker(file, 0, "Vinculum SKU");
+    log(logId, `Found ${raw.length} rows.`);
+    if (raw.length === 0) throw new Error("Found 0 rows in the file — the header row (\"Vinculum SKU\" etc.) wasn't detected. Check this is the right file/sheet.");
+    const { rows } = window.Importers.normalizeMaster(raw);
+    log(logId, `Normalized ${rows.length} SKUs. Upserting…`);
+    if (rows.length === 0) throw new Error("0 of " + raw.length + " rows had a usable \"Vinculum SKU\" value — check the file's column headers match what's expected.");
+    // de-dupe within this file (last occurrence wins) so ON CONFLICT never
+    // sees the same key twice in one batch, which Postgres upsert rejects.
+    const deduped = [...new Map(rows.map(r => [r.vinculum_sku, r])).values()];
+    await chunkedUpsert("sku_master", deduped, "vinculum_sku", "progress-master", logId);
+    log(logId, "Done. " + deduped.length + " SKUs imported.");
+    await logUpload({ file_type: "sku_master", file_name: file.name, row_count: deduped.length });
+  } catch (e) {
+    log(logId, "Failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---- 2. INVENTORY -------------------------------------------------------
+document.getElementById("file-inventory").addEventListener("change", () => {
+  document.getElementById("btn-inventory").disabled = !document.getElementById("file-inventory").files.length;
+});
+document.getElementById("btn-inventory").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-inventory");
+  const logId = "log-inventory";
+  document.getElementById(logId).innerHTML = "";
+  btn.disabled = true;
+  try {
+    const file = document.getElementById("file-inventory").files[0];
+    const snapshotDate = document.getElementById("inv-date").value;
+    const warehouse = document.getElementById("inv-warehouse").value.trim();
+    if (!snapshotDate) { log(logId, "Pick a snapshot date first."); btn.disabled = false; return; }
+    if (!warehouse) { log(logId, "Enter a warehouse name first (e.g. ICWN) — needed so the two warehouses' stock adds up correctly instead of overwriting each other."); btn.disabled = false; return; }
+    const { skuSet } = await fetchAllMasterIndex(logId);
+    log(logId, "Parsing " + file.name + "…");
+    const raw = await parseSheetSimple(file);
+    log(logId, `Found ${raw.length} rows.`);
+    if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file.");
+    if (skuSet.size === 0) log(logId, "Warning: SKU Master is empty — every row will show as unmatched until you upload it.");
+    const rows = window.Importers.normalizeInventory(raw, skuSet, snapshotDate, file.name, warehouse);
+    const matched = rows.filter(r => r.matched).length;
+    log(logId, `Normalized ${rows.length} rows (${matched} matched master, ${rows.length - matched} legacy/unmapped).`);
+    log(logId, `Clearing any existing ${warehouse} snapshot for ${snapshotDate}…`);
+    const { error: delErr } = await sb.from("inventory_snapshot").delete().eq("snapshot_date", snapshotDate).eq("warehouse", warehouse);
+    if (delErr) throw delErr;
+    log(logId, "Inserting…");
+    await chunkedUpsert("inventory_snapshot", rows, null, "progress-inventory", logId);
+    log(logId, "Done. " + rows.length + " rows imported for " + warehouse + " / " + snapshotDate + ". Other warehouses' stock is untouched — the dashboard sums them automatically.");
+    await logUpload({ file_type: "inventory", file_name: file.name, snapshot_date: snapshotDate, row_count: rows.length, matched_count: matched, unmatched_count: rows.length - matched, notes: "warehouse=" + warehouse });
+    populateWarehouseList();
+  } catch (e) {
+    log(logId, "Failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---- 3. SALES -------------------------------------------------------------
+document.getElementById("file-sales").addEventListener("change", () => {
+  document.getElementById("btn-sales").disabled = !document.getElementById("file-sales").files.length;
+});
+document.getElementById("btn-sales").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-sales");
+  const logId = "log-sales";
+  document.getElementById(logId).innerHTML = "";
+  btn.disabled = true;
+  try {
+    const file = document.getElementById("file-sales").files[0];
+    const { eanToSku } = await fetchAllMasterIndex(logId);
+    log(logId, "Parsing " + file.name + "…");
+    const raw = await parseSheetSimple(file);
+    log(logId, `Found ${raw.length} rows.`);
+    if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file/sheet.");
+    if (eanToSku.size === 0) log(logId, "Warning: SKU Master is empty — every row will show as unmatched until you upload it.");
+    const rows = window.Importers.normalizeSales(raw, eanToSku);
+    const matched = rows.filter(r => r.matched).length;
+    const periods = [...new Set(rows.map(r => r.period_key).filter(Boolean))];
+    log(logId, `Normalized ${rows.length} rows (${matched} matched, ${rows.length - matched} unmatched EAN). Periods found: ${periods.join(", ")}`);
+    if (periods.length > 1) {
+      log(logId, "Note: this file spans more than one month — that's fine, each month's rows replace that month's existing data independently.");
+    }
+    for (const pk of periods) {
+      log(logId, "Clearing existing rows for " + pk + "…");
+      const { error: delErr } = await sb.from("sales").delete().eq("period_key", pk);
+      if (delErr) throw delErr;
+    }
+    log(logId, "Inserting…");
+    await chunkedUpsert("sales", rows, null, "progress-sales", logId);
+    log(logId, "Done. " + rows.length + " rows imported.");
+    await logUpload({ file_type: "sales", file_name: file.name, period_key: periods.join(","), row_count: rows.length, matched_count: matched, unmatched_count: rows.length - matched });
+  } catch (e) {
+    log(logId, "Failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---- Upload log table -------------------------------------------------
+async function loadUploadLog() {
+  const { data } = await sb.from("upload_log").select("*").order("uploaded_at", { ascending: false }).limit(20);
+  document.getElementById("log-table").innerHTML = (data || []).map(r => `
+    <tr>
+      <td>${new Date(r.uploaded_at).toLocaleString("en-IN")}</td>
+      <td>${r.file_type}</td>
+      <td>${r.file_name || "—"}</td>
+      <td>${r.row_count ?? "—"}</td>
+      <td>${r.matched_count ?? "—"}</td>
+      <td>${r.unmatched_count ?? "—"}</td>
+      <td class="text-muted">${r.notes || (r.period_key ? "period=" + r.period_key : "") || "—"}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="7" class="empty-state">No uploads yet.</td></tr>`;
+}
+async function populateWarehouseList() {
+  const { data } = await sb.from("inventory_snapshot").select("warehouse").limit(5000);
+  const names = [...new Set((data || []).map(r => r.warehouse).filter(Boolean))];
+  document.getElementById("warehouse-list").innerHTML = names.map(n => `<option value="${n}">`).join("");
+}
+
+loadUploadLog();
+populateWarehouseList();
+</script>
+</body>
+</html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inventory Health — Iconic Creation Inventory Dashboard</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="assets/config.js"></script>
+<script src="assets/supabase-client.js"></script>
+<script src="assets/charts.js"></script>
+<script src="assets/nav.js"></script>
+</head>
+<body>
+<div class="app-shell">
+  <nav class="sidebar" id="app-nav"></nav>
+  <main class="main">
+    <div class="page-header">
+      <div>
+        <h1>Inventory Health</h1>
+        <p>Stock cover, sell-through, and health flag — combined stock across both warehouses (not portal-specific).</p>
+      </div>
+    </div>
+
+    <div class="filter-row">
+      <label>Group by</label>
+      <select id="f-group">
+        <option value="article_color">Article + Colour</option>
+        <option value="article">Article</option>
+      </select>
+      <label>Window</label>
+      <select id="f-days">
+        <option value="30">Trailing 30 days</option>
+        <option value="60">Trailing 60 days</option>
+        <option value="90">Trailing 90 days</option>
+      </select>
+      <label>Brand</label>
+      <select id="f-brand"><option value="">All brands</option></select>
+      <label>Health</label>
+      <select id="f-flag">
+        <option value="">All</option>
+        <option value="STOCKOUT">Stockout</option>
+        <option value="LOW_COVER">Low stock cover</option>
+        <option value="HEALTHY">Healthy</option>
+        <option value="OVERSTOCK">Overstock</option>
+        <option value="DEAD_STOCK">Dead stock</option>
+        <option value="DISCONTINUED_OUT">Discontinued (sold out)</option>
+        <option value="LEGACY_UNMAPPED">Legacy / not in master</option>
+      </select>
+      <input type="text" id="f-search" placeholder="Search article / colour…" style="width:220px">
+      <span class="text-muted" id="result-count" style="margin-left:auto"></span>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr id="table-head-row">
+            <!-- filled in by renderHead() since column 1 depends on grouping -->
+          </tr>
+        </thead>
+        <tbody id="table-body"></tbody>
+      </table>
+    </div>
+    <div class="filter-row" style="margin-top:14px">
+      <button class="btn secondary" id="prev-page">← Prev</button>
+      <span id="page-label" class="text-muted"></span>
+      <button class="btn secondary" id="next-page">Next →</button>
+    </div>
+  </main>
+</div>
+<script src="assets/auth-guard.js"></script>
+<script>
+renderNav("inventory");
+
+const PAGE_SIZE = 100;
+let page = 0;
+let sortCol = "stock_cover_days";
+let sortAsc = true;
+
+const params = new URLSearchParams(window.location.search);
+if (params.get("flag")) document.getElementById("f-flag").value = params.get("flag");
+if (params.get("group")) document.getElementById("f-group").value = params.get("group");
+
+function badgeFor(flag) {
+  const map = { STOCKOUT: "critical", LOW_COVER: "warning", OVERSTOCK: "serious", DEAD_STOCK: "muted", DISCONTINUED_OUT: "muted", LEGACY_UNMAPPED: "muted", HEALTHY: "good" };
+  return `<span class="badge badge-${map[flag] || "muted"}">${HEALTH_LABEL[flag] || flag}</span>`;
+}
+
+function currentGroup() {
+  return document.getElementById("f-group").value; // "article_color" | "article"
+}
+
+function renderHead() {
+  const g = currentGroup();
+  const groupLabel = g === "article" ? "Article" : "Article + Colour";
+  document.getElementById("table-head-row").innerHTML = `
+    <th data-sort="group_key">${groupLabel}</th>
+    <th data-sort="sku_count"># SKUs</th>
+    <th data-sort="brand">Brand</th>
+    <th data-sort="article_status">Status</th>
+    <th data-sort="available_qty">Stock</th>
+    <th data-sort="units_sold">Sold (window)</th>
+    <th data-sort="daily_velocity">Daily velocity</th>
+    <th data-sort="stock_cover_days">Cover (days)</th>
+    <th data-sort="sell_through_rate">Sell-through</th>
+    <th data-sort="health_flag">Health</th>
+  `;
+  document.querySelectorAll("th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const col = th.dataset.sort;
+      if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = true; }
+      page = 0;
+      loadTable();
+    });
+  });
+}
+
+async function populateBrandFilter() {
+  const { data } = await sb.rpc("fn_distinct_brands");
+  const sel = document.getElementById("f-brand");
+  (data || []).forEach(r => { const o = document.createElement("option"); o.value = r.brand; o.textContent = r.brand; sel.appendChild(o); });
+}
+
+async function loadTable() {
+  const days = Number(document.getElementById("f-days").value);
+  const group = currentGroup();
+  const brand = document.getElementById("f-brand").value;
+  const flag = document.getElementById("f-flag").value;
+  const search = document.getElementById("f-search").value.trim();
+
+  let query = sb.rpc("fn_inventory_health", { p_days: days, p_group: group }, { count: "exact" });
+  if (brand) query = query.eq("brand", brand);
+  if (flag) query = query.eq("health_flag", flag);
+  if (search) query = query.or(`group_key.ilike.%${search}%,article.ilike.%${search}%,color.ilike.%${search}%`);
+  query = query.order(sortCol, { ascending: sortAsc, nullsFirst: false });
+  query = query.range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+
+  const { data, error, count } = await query;
+  if (error) { console.error(error); document.getElementById("table-body").innerHTML = `<tr><td colspan="10">Error: ${error.message}</td></tr>`; return; }
+
+  document.getElementById("result-count").textContent = count != null ? `${count.toLocaleString("en-IN")} ${group === "article" ? "articles" : "article/colour groups"}` : "";
+  document.getElementById("page-label").textContent = `Page ${page + 1}${count ? " of " + Math.ceil(count / PAGE_SIZE) : ""}`;
+
+  document.getElementById("table-body").innerHTML = (data || []).map(r => `
+    <tr>
+      <td class="mono">${r.group_key || "—"}</td>
+      <td>${r.sku_count ?? "—"}</td>
+      <td>${r.brand || "—"}</td>
+      <td class="text-muted">${r.article_status || "—"}</td>
+      <td>${fmtNum(r.available_qty)}</td>
+      <td>${fmtNum(r.units_sold)}</td>
+      <td>${r.daily_velocity ?? "—"}</td>
+      <td>${r.stock_cover_days ?? "—"}</td>
+      <td>${r.sell_through_rate != null ? (r.sell_through_rate * 100).toFixed(1) + "%" : "—"}</td>
+      <td>${badgeFor(r.health_flag)}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="10" class="empty-state">No matching rows.</td></tr>`;
+}
+
+["f-group"].forEach(id => document.getElementById(id).addEventListener("change", () => {
+  sortCol = "stock_cover_days"; sortAsc = true; page = 0; renderHead(); loadTable();
+}));
+["f-days", "f-brand", "f-flag"].forEach(id => document.getElementById(id).addEventListener("change", () => { page = 0; loadTable(); }));
+let searchTimer;
+document.getElementById("f-search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { page = 0; loadTable(); }, 350); });
+document.getElementById("prev-page").addEventListener("click", () => { if (page > 0) { page--; loadTable(); } });
+document.getElementById("next-page").addEventListener("click", () => { page++; loadTable(); });
+
+renderHead();
+populateBrandFilter();
+loadTable();
+</script>
+</body>
+</html>

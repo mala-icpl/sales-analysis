@@ -191,6 +191,12 @@ $$;
 
 -- Full SKU health table: master info + current stock + trailing sales,
 -- summed across all portals. This is what the Inventory Health page reads.
+--
+-- Driven from the UNION of sku_master and v_current_inventory (not just
+-- sku_master) so that legacy/obsolete SKUs — intentionally removed from
+-- master but still carrying leftover stock — still show up, flagged
+-- health_flag='LEGACY_UNMAPPED' / is_legacy=true, instead of silently
+-- disappearing from health results.
 CREATE OR REPLACE FUNCTION fn_sku_health(p_days int DEFAULT 30)
 RETURNS TABLE (
   vinculum_sku      text,
@@ -200,15 +206,16 @@ RETURNS TABLE (
   brand             text,
   article_status    text,
   mrp               numeric,
-  available_qty     integer,
-  total_qty         integer,
+  available_qty     numeric,
+  total_qty         numeric,
   units_sold        numeric,
   units_returned    numeric,
   net_revenue       numeric,
   daily_velocity    numeric,
   stock_cover_days  numeric,
   sell_through_rate numeric,
-  health_flag       text
+  health_flag       text,
+  is_legacy         boolean
 ) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   WITH agg AS (
     SELECT vinculum_sku,
@@ -217,17 +224,22 @@ RETURNS TABLE (
            SUM(net_revenue) AS net_revenue
     FROM fn_sku_sales_agg(p_days)
     GROUP BY vinculum_sku
+  ),
+  universe AS (
+    SELECT vinculum_sku FROM sku_master
+    UNION
+    SELECT vinculum_sku FROM v_current_inventory
   )
   SELECT
-    m.vinculum_sku,
-    m.article,
-    m.color,
-    m.size,
-    m.brand,
-    m.article_status,
-    m.mrp,
-    COALESCE(i.available_qty, 0) AS available_qty,
-    COALESCE(i.total_qty, 0) AS total_qty,
+    u.vinculum_sku,
+    COALESCE(m.article, split_part(u.vinculum_sku, '_', 1)) AS article,
+    COALESCE(m.color, split_part(u.vinculum_sku, '_', 2)) AS color,
+    COALESCE(m.size, split_part(u.vinculum_sku, '_', 3)) AS size,
+    COALESCE(m.brand, i.brand_code, 'Unmapped') AS brand,
+    COALESCE(m.article_status, 'Unmapped (legacy)') AS article_status,
+    COALESCE(m.mrp, i.mrp) AS mrp,
+    COALESCE(i.available_qty, 0)::numeric AS available_qty,
+    COALESCE(i.total_qty, 0)::numeric AS total_qty,
     COALESCE(a.units_sold, 0) AS units_sold,
     COALESCE(a.units_returned, 0) AS units_returned,
     COALESCE(a.net_revenue, 0) AS net_revenue,
@@ -241,6 +253,8 @@ RETURNS TABLE (
       ELSE ROUND(COALESCE(a.units_sold, 0)::numeric / (COALESCE(a.units_sold, 0) + COALESCE(i.available_qty, 0)), 3)
     END AS sell_through_rate,
     CASE
+      WHEN m.vinculum_sku IS NULL
+        THEN 'LEGACY_UNMAPPED'   -- has inventory (and maybe sales) but was intentionally removed from master
       WHEN COALESCE(i.available_qty, 0) = 0 AND COALESCE(a.units_sold,0) > 0 AND m.article_status = 'Article Live'
         THEN 'STOCKOUT'          -- selling, live, out of stock: reorder
       WHEN COALESCE(i.available_qty, 0) = 0 AND COALESCE(a.units_sold,0) > 0 AND m.article_status <> 'Article Live'
@@ -252,11 +266,13 @@ RETURNS TABLE (
       WHEN COALESCE(a.units_sold, 0) > 0 AND COALESCE(i.available_qty, 0) / (COALESCE(a.units_sold, 0) / GREATEST(p_days, 1)::numeric) > 90
         THEN 'OVERSTOCK'         -- selling, but more than 3 months of stock on hand
       ELSE 'HEALTHY'
-    END AS health_flag
-  FROM sku_master m
-  LEFT JOIN v_current_inventory i ON i.vinculum_sku = m.vinculum_sku
-  LEFT JOIN agg a ON a.vinculum_sku = m.vinculum_sku
-  WHERE m.article_status <> 'Inactive' OR m.article_status IS NULL;
+    END AS health_flag,
+    (m.vinculum_sku IS NULL) AS is_legacy
+  FROM universe u
+  LEFT JOIN sku_master m ON m.vinculum_sku = u.vinculum_sku
+  LEFT JOIN v_current_inventory i ON i.vinculum_sku = u.vinculum_sku
+  LEFT JOIN agg a ON a.vinculum_sku = u.vinculum_sku
+  WHERE m.article_status IS DISTINCT FROM 'Inactive';
 $$;
 
 -- One-row summary used by the Overview dashboard's KPI tiles, so the
@@ -273,21 +289,116 @@ RETURNS TABLE (
   stockout_skus      bigint,
   low_cover_skus     bigint,
   overstock_skus     bigint,
+  discontinued_out_skus bigint,
+  legacy_skus        bigint,
   sell_through_rate  numeric
 ) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
   SELECT
     COUNT(*),
-    SUM(available_qty),
+    SUM(available_qty)::bigint,
     SUM(available_qty * COALESCE(mrp, 0)),
     SUM(units_sold),
     SUM(net_revenue),
     COUNT(*) FILTER (WHERE health_flag = 'DEAD_STOCK'),
-    SUM(available_qty) FILTER (WHERE health_flag = 'DEAD_STOCK'),
+    SUM(available_qty) FILTER (WHERE health_flag = 'DEAD_STOCK')::bigint,
     COUNT(*) FILTER (WHERE health_flag = 'STOCKOUT'),
     COUNT(*) FILTER (WHERE health_flag = 'LOW_COVER'),
     COUNT(*) FILTER (WHERE health_flag = 'OVERSTOCK'),
+    COUNT(*) FILTER (WHERE health_flag = 'DISCONTINUED_OUT'),
+    COUNT(*) FILTER (WHERE is_legacy),
     ROUND(SUM(units_sold) / NULLIF(SUM(units_sold) + SUM(available_qty), 0), 3)
   FROM fn_sku_health(p_days);
+$$;
+
+-- Rolls fn_sku_health up to SKU / Article+Colour / Article level for the
+-- Inventory Health page's grouping filter (she wants Article+Colour and
+-- Article as the two grouping options — not raw per-SKU rows).
+CREATE OR REPLACE FUNCTION fn_inventory_health(p_days int DEFAULT 30, p_group text DEFAULT 'sku')
+RETURNS TABLE (
+  group_key         text,
+  vinculum_sku      text,
+  article           text,
+  color             text,
+  size              text,
+  sku_count         bigint,
+  brand             text,
+  article_status    text,
+  mrp               numeric,
+  available_qty     numeric,
+  total_qty         numeric,
+  units_sold        numeric,
+  units_returned    numeric,
+  net_revenue       numeric,
+  daily_velocity    numeric,
+  stock_cover_days  numeric,
+  sell_through_rate numeric,
+  health_flag       text,
+  is_legacy         boolean
+) LANGUAGE plpgsql STABLE SET search_path = public, pg_temp AS $$
+BEGIN
+  IF p_group = 'sku' THEN
+    RETURN QUERY
+    SELECT
+      h.vinculum_sku, h.vinculum_sku, h.article, h.color, h.size, 1::bigint,
+      h.brand, h.article_status, h.mrp,
+      h.available_qty, h.total_qty, h.units_sold, h.units_returned, h.net_revenue,
+      h.daily_velocity, h.stock_cover_days, h.sell_through_rate, h.health_flag, h.is_legacy
+    FROM fn_sku_health(p_days) h;
+
+  ELSIF p_group = 'article_color' THEN
+    RETURN QUERY
+    SELECT
+      (COALESCE(h.article,'?') || ' / ' || COALESCE(h.color,'?')) AS group_key,
+      NULL::text, h.article, h.color, NULL::text, COUNT(*)::bigint,
+      MAX(h.brand), MAX(h.article_status), MAX(h.mrp),
+      SUM(h.available_qty), SUM(h.total_qty), SUM(h.units_sold), SUM(h.units_returned), SUM(h.net_revenue),
+      ROUND(SUM(h.units_sold) / GREATEST(p_days,1)::numeric, 3),
+      CASE WHEN SUM(h.units_sold) = 0 THEN NULL
+           ELSE ROUND(SUM(h.available_qty) / (SUM(h.units_sold) / GREATEST(p_days,1)::numeric), 1) END,
+      CASE WHEN (SUM(h.units_sold) + SUM(h.available_qty)) = 0 THEN NULL
+           ELSE ROUND(SUM(h.units_sold) / (SUM(h.units_sold) + SUM(h.available_qty)), 3) END,
+      CASE
+        WHEN bool_and(h.is_legacy) THEN 'LEGACY_UNMAPPED'
+        WHEN SUM(h.available_qty) = 0 AND SUM(h.units_sold) > 0 AND bool_or(h.article_status = 'Article Live') THEN 'STOCKOUT'
+        WHEN SUM(h.available_qty) = 0 AND SUM(h.units_sold) > 0 THEN 'DISCONTINUED_OUT'
+        WHEN SUM(h.available_qty) > 0 AND SUM(h.units_sold) = 0 THEN 'DEAD_STOCK'
+        WHEN SUM(h.units_sold) > 0 AND SUM(h.available_qty) / (SUM(h.units_sold) / GREATEST(p_days,1)::numeric) < 15 THEN 'LOW_COVER'
+        WHEN SUM(h.units_sold) > 0 AND SUM(h.available_qty) / (SUM(h.units_sold) / GREATEST(p_days,1)::numeric) > 90 THEN 'OVERSTOCK'
+        ELSE 'HEALTHY'
+      END,
+      bool_and(h.is_legacy)
+    FROM fn_sku_health(p_days) h
+    GROUP BY h.article, h.color;
+
+  ELSIF p_group = 'article' THEN
+    RETURN QUERY
+    SELECT
+      COALESCE(h.article,'?') AS group_key,
+      NULL::text, h.article, NULL::text, NULL::text, COUNT(*)::bigint,
+      MAX(h.brand), MAX(h.article_status), MAX(h.mrp),
+      SUM(h.available_qty), SUM(h.total_qty), SUM(h.units_sold), SUM(h.units_returned), SUM(h.net_revenue),
+      ROUND(SUM(h.units_sold) / GREATEST(p_days,1)::numeric, 3),
+      CASE WHEN SUM(h.units_sold) = 0 THEN NULL
+           ELSE ROUND(SUM(h.available_qty) / (SUM(h.units_sold) / GREATEST(p_days,1)::numeric), 1) END,
+      CASE WHEN (SUM(h.units_sold) + SUM(h.available_qty)) = 0 THEN NULL
+           ELSE ROUND(SUM(h.units_sold) / (SUM(h.units_sold) + SUM(h.available_qty)), 3) END,
+      CASE
+        WHEN bool_and(h.is_legacy) THEN 'LEGACY_UNMAPPED'
+        WHEN SUM(h.available_qty) = 0 AND SUM(h.units_sold) > 0 AND bool_or(h.article_status = 'Article Live') THEN 'STOCKOUT'
+        WHEN SUM(h.available_qty) = 0 AND SUM(h.units_sold) > 0 THEN 'DISCONTINUED_OUT'
+        WHEN SUM(h.available_qty) > 0 AND SUM(h.units_sold) = 0 THEN 'DEAD_STOCK'
+        WHEN SUM(h.units_sold) > 0 AND SUM(h.available_qty) / (SUM(h.units_sold) / GREATEST(p_days,1)::numeric) < 15 THEN 'LOW_COVER'
+        WHEN SUM(h.units_sold) > 0 AND SUM(h.available_qty) / (SUM(h.units_sold) / GREATEST(p_days,1)::numeric) > 90 THEN 'OVERSTOCK'
+        ELSE 'HEALTHY'
+      END,
+      bool_and(h.is_legacy)
+    FROM fn_sku_health(p_days) h
+    GROUP BY h.article;
+
+  ELSE
+    RAISE EXCEPTION 'invalid p_group: %, expected sku, article_color, or article', p_group;
+  END IF;
+END;
 $$;
 
 -- Portal x Brand sales rollup for a trailing window — feeds the Overview and
@@ -359,11 +470,130 @@ BEGIN
 END;
 $$;
 
--- Distinct brand list for filter dropdowns — avoids relying on PostgREST's
--- default 1000-row cap picking up every distinct value by chance.
+-- Distinct brand list for filter dropdowns. Driven from fn_sku_health (not
+-- sku_master directly) so it's always populated from whatever brands
+-- actually appear in health results — including inventory's brand_code
+-- fallback for legacy/unmapped SKUs — even before SKU Master has been
+-- uploaded. (Originally read straight from sku_master, which left this
+-- dropdown empty whenever master was empty/not yet uploaded — the window
+-- arg is fixed at 30 since it only affects sales/velocity figures, not
+-- which SKUs/brands exist.)
 CREATE OR REPLACE FUNCTION fn_distinct_brands()
 RETURNS TABLE (brand text) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
-  SELECT DISTINCT m.brand FROM sku_master m WHERE m.brand IS NOT NULL ORDER BY 1;
+  SELECT DISTINCT h.brand FROM fn_sku_health(30) h WHERE h.brand IS NOT NULL ORDER BY 1;
+$$;
+
+-- Per Article / Article+Colour / SKU, compares units sold on a chosen
+-- "focus" portal vs every other portal combined, across any number of
+-- selected calendar months — powers the Portal Opportunity page (campaign
+-- targeting: find articles doing well elsewhere but not on a given portal,
+-- or vice versa). Returns one row per group PER MONTH (long format, like
+-- fn_sales_by_period) so the page can pivot into as many month columns as
+-- the user picks, rather than a fixed number.
+CREATE OR REPLACE FUNCTION fn_portal_opportunity(
+  p_group    text DEFAULT 'article_color',   -- 'sku' | 'article_color' | 'article'
+  p_portal   text DEFAULT 'Amazon',
+  p_periods  text[] DEFAULT ARRAY[]::text[]
+)
+RETURNS TABLE (
+  group_key      text,
+  vinculum_sku   text,
+  article        text,
+  color          text,
+  sku_count      bigint,
+  brand          text,
+  available_qty  numeric,
+  period_key     text,
+  portal_units   numeric,
+  other_units    numeric
+) LANGUAGE plpgsql STABLE SET search_path = public, pg_temp AS $$
+BEGIN
+  IF p_group NOT IN ('sku', 'article_color', 'article') THEN
+    RAISE EXCEPTION 'invalid p_group: %, expected sku, article_color, or article', p_group;
+  END IF;
+
+  RETURN QUERY
+  WITH universe AS (
+    SELECT sm.vinculum_sku FROM sku_master sm
+    UNION
+    SELECT ci.vinculum_sku FROM v_current_inventory ci
+  ),
+  base AS (
+    SELECT
+      u.vinculum_sku,
+      COALESCE(m.article, split_part(u.vinculum_sku, '_', 1)) AS article,
+      COALESCE(m.color, split_part(u.vinculum_sku, '_', 2)) AS color,
+      COALESCE(m.brand, i.brand_code, 'Unmapped') AS brand,
+      COALESCE(i.available_qty, 0)::numeric AS available_qty
+    FROM universe u
+    LEFT JOIN sku_master m ON m.vinculum_sku = u.vinculum_sku
+    LEFT JOIN v_current_inventory i ON i.vinculum_sku = u.vinculum_sku
+  ),
+  sales_agg AS (
+    SELECT
+      s.vinculum_sku,
+      s.period_key,
+      SUM(CASE WHEN s.portal = p_portal THEN s.qty ELSE 0 END) AS portal_units,
+      SUM(CASE WHEN s.portal <> p_portal THEN s.qty ELSE 0 END) AS other_units
+    FROM sales s
+    WHERE s.vinculum_sku IS NOT NULL
+      AND s.status IN ('Shipped complete','delivered','Pick complete','Packed')
+      AND s.period_key = ANY(p_periods)
+    GROUP BY s.vinculum_sku, s.period_key
+  ),
+  -- every (SKU, requested period) combination, so months with 0 sales still
+  -- show up as a 0 column rather than being missing from the pivot
+  sku_x_period AS (
+    SELECT b.vinculum_sku, pk.period_key
+    FROM base b
+    CROSS JOIN unnest(p_periods) AS pk(period_key)
+  ),
+  joined AS (
+    SELECT
+      b.vinculum_sku, b.article, b.color, b.brand, b.available_qty,
+      sxp.period_key,
+      COALESCE(sa.portal_units, 0) AS portal_units,
+      COALESCE(sa.other_units, 0) AS other_units
+    FROM sku_x_period sxp
+    JOIN base b ON b.vinculum_sku = sxp.vinculum_sku
+    LEFT JOIN sales_agg sa ON sa.vinculum_sku = sxp.vinculum_sku AND sa.period_key = sxp.period_key
+  ),
+  -- keep a SKU only if it has stock, or sold something (on any portal) in
+  -- ANY of the requested periods — otherwise the pivot would be all zeros
+  relevant AS (
+    SELECT j.vinculum_sku FROM joined j
+    GROUP BY j.vinculum_sku
+    HAVING MAX(j.available_qty) > 0 OR SUM(j.portal_units + j.other_units) > 0
+  )
+  SELECT * FROM (
+    SELECT
+      j.vinculum_sku AS group_key, j.vinculum_sku, j.article, j.color, 1::bigint AS sku_count,
+      j.brand, j.available_qty, j.period_key, j.portal_units, j.other_units
+    FROM joined j
+    JOIN relevant r ON r.vinculum_sku = j.vinculum_sku
+    WHERE p_group = 'sku'
+
+    UNION ALL
+
+    SELECT
+      (COALESCE(j.article,'?') || ' / ' || COALESCE(j.color,'?')), NULL::text, j.article, j.color, COUNT(DISTINCT j.vinculum_sku)::bigint,
+      MAX(j.brand), SUM(j.available_qty), j.period_key, SUM(j.portal_units), SUM(j.other_units)
+    FROM joined j
+    JOIN relevant r ON r.vinculum_sku = j.vinculum_sku
+    WHERE p_group = 'article_color'
+    GROUP BY j.article, j.color, j.period_key
+
+    UNION ALL
+
+    SELECT
+      COALESCE(j.article,'?'), NULL::text, j.article, NULL::text, COUNT(DISTINCT j.vinculum_sku)::bigint,
+      MAX(j.brand), SUM(j.available_qty), j.period_key, SUM(j.portal_units), SUM(j.other_units)
+    FROM joined j
+    JOIN relevant r ON r.vinculum_sku = j.vinculum_sku
+    WHERE p_group = 'article'
+    GROUP BY j.article, j.period_key
+  ) result;
+END;
 $$;
 
 -- ----------------------------------------------------------------------------
@@ -391,3 +621,74 @@ CREATE POLICY "authenticated read/write sales" ON sales
 DROP POLICY IF EXISTS "authenticated read/write upload_log" ON upload_log;
 CREATE POLICY "authenticated read/write upload_log" ON upload_log
   FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');
+
+-- ----------------------------------------------------------------------------
+-- 7. CATALOGUE MASTER
+-- Creative/listing data for building portal catalogues (title, category,
+-- material, heel type, etc.) — deliberately separate from sku_master so
+-- filling this in (slowly, article by article) can never affect
+-- inventory/sales matching. Keyed by vinculum_sku, same as everywhere else.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS catalogue_master (
+  vinculum_sku    text PRIMARY KEY,
+  article         text,
+  color           text,
+  brand           text,
+  vendor          text,
+  segment         text,       -- Girl / Boy / Women / Men / Unisex etc.
+  category        text,       -- e.g. Heels, Flats, Sneakers
+  age_group       text,       -- e.g. 6-6.5Y
+  euro_size       text,
+  uk_size         text,
+  us_size         text,
+  cm_size         text,
+  upper           text,       -- upper material, e.g. Synthetic
+  sole            text,
+  heel_height     text,       -- e.g. "1.5 Inches"
+  heel_type       text,       -- e.g. Block / Stiletto / Wedge / Flat
+  mrp             numeric,
+  hsn             text,
+  model_no        text,
+  item_name       text,       -- internal working name
+  display_name    text,       -- customer-facing listing title
+  ean             text,       -- barcode
+  asin            text,
+  notes           text,
+  -- spare fields for anything that comes up later, without needing a
+  -- schema change each time — use for whatever, rename their meaning
+  -- in your own head, they're exposed in the template/download/upload too.
+  custom_field_1  text,
+  custom_field_2  text,
+  custom_field_3  text,
+  updated_at      timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalogue_article  ON catalogue_master (article);
+CREATE INDEX IF NOT EXISTS idx_catalogue_brand     ON catalogue_master (brand);
+CREATE INDEX IF NOT EXISTS idx_catalogue_category  ON catalogue_master (category);
+
+ALTER TABLE catalogue_master ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "authenticated read/write catalogue_master" ON catalogue_master;
+CREATE POLICY "authenticated read/write catalogue_master" ON catalogue_master
+  FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');
+
+-- How many catalogue rows exist vs how many SKUs actually need one (i.e.
+-- SKUs in sku_master that don't yet have a matching catalogue_master row) —
+-- powers a small coverage stat on the Catalogue page.
+CREATE OR REPLACE FUNCTION fn_catalogue_coverage()
+RETURNS TABLE (
+  total_master_skus    bigint,
+  catalogued_skus      bigint,
+  uncatalogued_skus    bigint
+) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
+  SELECT
+    (SELECT COUNT(*) FROM sku_master),
+    (SELECT COUNT(*) FROM sku_master m WHERE EXISTS (SELECT 1 FROM catalogue_master c WHERE c.vinculum_sku = m.vinculum_sku)),
+    (SELECT COUNT(*) FROM sku_master m WHERE NOT EXISTS (SELECT 1 FROM catalogue_master c WHERE c.vinculum_sku = m.vinculum_sku));
+$$;
+
+CREATE OR REPLACE FUNCTION fn_distinct_categories()
+RETURNS TABLE (category text) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
+  SELECT DISTINCT c.category FROM catalogue_master c WHERE c.category IS NOT NULL ORDER BY 1;
+$$;

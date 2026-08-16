@@ -145,11 +145,32 @@ async function parseSheetWithMarker(file, sheetIndexOrName, markerCell) {
   return XLSX.utils.sheet_to_json(sheet, { range: headerRow, defval: null });
 }
 
-async function parseSheetSimple(file) {
+// Like parseSheetWithMarker, but also scans EVERY sheet in the workbook (not
+// just sheet 0) looking for the marker column. Needed because some Vinclum
+// exports — especially custom multi-month date-range exports — put a cover/
+// summary sheet first and the real line-item data on a later sheet, or add
+// a title row above the real header on the data sheet. Plain "always read
+// sheet 0, row 0" (the old parseSheetSimple) silently returns 0 rows in
+// that case. Falls back to the old sheet-0/row-0 behaviour only if the
+// marker isn't found anywhere, so a genuinely-wrong file still surfaces the
+// existing "Found 0 rows" error instead of failing silently.
+async function parseSheetRobust(file, markerCell) {
   const buf = await readFileAsArrayBuffer(file);
   const wb = XLSX.read(buf, { type: "array" });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  return XLSX.utils.sheet_to_json(sheet, { defval: null });
+  for (const sheetName of wb.SheetNames) {
+    const sheet = wb.Sheets[sheetName];
+    if (!sheet || !sheet["!ref"]) continue; // empty/blank sheet, skip
+    const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+    for (let i = 0; i < Math.min(raw.length, 10); i++) {
+      const row = raw[i];
+      if (row && row.some(cell => typeof cell === "string" && cell.trim() === markerCell)) {
+        return XLSX.utils.sheet_to_json(sheet, { range: i, defval: null });
+      }
+    }
+  }
+  // Marker not found on any sheet — fall back to the original behaviour.
+  const fallbackName = wb.SheetNames.find(n => wb.Sheets[n] && wb.Sheets[n]["!ref"]) || wb.SheetNames[0];
+  return XLSX.utils.sheet_to_json(wb.Sheets[fallbackName], { defval: null });
 }
 
 // ---- Batch upsert/insert helper -------------------------------------------
@@ -299,9 +320,9 @@ document.getElementById("btn-inventory").addEventListener("click", async () => {
     if (!warehouse) { log(logId, "Enter a warehouse name first (e.g. ICWN) — needed so the two warehouses' stock adds up correctly instead of overwriting each other."); btn.disabled = false; return; }
     const { skuSet } = await fetchAllMasterIndex(logId);
     log(logId, "Parsing " + file.name + "…");
-    const raw = await parseSheetSimple(file);
+    const raw = await parseSheetRobust(file, "SKU Desc");
     log(logId, `Found ${raw.length} rows.`);
-    if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file.");
+    if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file. If the file has multiple sheets/tabs, make sure one of them has a \"SKU Desc\" column.");
     if (skuSet.size === 0) log(logId, "Warning: SKU Master is empty — every row will show as unmatched until you upload it.");
     const rows = window.Importers.normalizeInventory(raw, skuSet, snapshotDate, file.name, warehouse);
     const matched = rows.filter(r => r.matched).length;
@@ -334,9 +355,9 @@ document.getElementById("btn-sales").addEventListener("click", async () => {
     const file = document.getElementById("file-sales").files[0];
     const { eanToSku } = await fetchAllMasterIndex(logId);
     log(logId, "Parsing " + file.name + "…");
-    const raw = await parseSheetSimple(file);
+    const raw = await parseSheetRobust(file, "ClientSKU");
     log(logId, `Found ${raw.length} rows.`);
-    if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file/sheet.");
+    if (raw.length === 0) throw new Error("Found 0 rows in the file — check this is the right file/sheet. If the file has multiple sheets/tabs (e.g. a summary tab plus a data tab), make sure one of them has a \"ClientSKU\" column.");
     if (eanToSku.size === 0) log(logId, "Warning: SKU Master is empty — every row will show as unmatched until you upload it.");
     const rows = window.Importers.normalizeSales(raw, eanToSku);
     const matched = rows.filter(r => r.matched).length;

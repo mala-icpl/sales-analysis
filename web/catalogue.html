@@ -170,12 +170,15 @@ const CATALOGUE_COLUMNS = [
 ];
 
 function downloadRows(rows, filename) {
-  const exportRows = rows.map(r => {
-    const out = {};
-    CATALOGUE_COLUMNS.forEach(([label, key]) => { out[label] = r[key] ?? ""; });
-    return out;
-  });
-  const ws = XLSX.utils.json_to_sheet(exportRows);
+  // Built as an array-of-arrays (header row first, always) rather than
+  // XLSX.utils.json_to_sheet(objects) — json_to_sheet derives its header
+  // row from the keys of the objects passed in, so an EMPTY rows array
+  // (e.g. SKU Master not uploaded yet) silently produced a totally blank
+  // sheet with no headers at all. Writing the header row explicitly means
+  // the template always shows the column names, even with zero data rows.
+  const labels = CATALOGUE_COLUMNS.map(([label]) => label);
+  const aoa = [labels, ...rows.map(r => CATALOGUE_COLUMNS.map(([, key]) => r[key] ?? ""))];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Catalogue");
   XLSX.writeFile(wb, filename);

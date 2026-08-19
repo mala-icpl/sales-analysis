@@ -165,15 +165,23 @@ function groupNoun(group, count) {
   return "article/colour groups";
 }
 
+// Returns the summary row {total_groups, total_stock} instead of just
+// writing to the DOM, so loadTable() can reuse total_groups for pagination
+// math — that means the main table query below no longer has to ask
+// Postgres for an exact count itself (which was forcing a window-function
+// pass over the ENTIRE result set before returning even page 1, roughly
+// doubling the cost of every load — this was the actual cause of the
+// "canceling statement due to statement timeout" errors).
 async function loadSummary(days, group, brand, flag, search) {
   const { data, error } = await sb.rpc("fn_inventory_health_summary", {
     p_days: days, p_group: group, p_brand: brand || null, p_flag: flag || null, p_search: search || null,
   }).maybeSingle();
-  if (error) { console.error(error); return; }
+  if (error) { console.error(error); return null; }
   document.getElementById("inv-summary-stock-label").textContent = brand ? `Total stock — ${brand}` : "Total stock (filtered)";
   document.getElementById("inv-summary-stock").textContent = fmtNum(data?.total_stock ?? 0);
   document.getElementById("inv-summary-groups-label").textContent = "Total " + groupNoun(group);
   document.getElementById("inv-summary-groups").textContent = fmtNum(data?.total_groups ?? 0);
+  return data;
 }
 
 async function loadTable() {
@@ -183,9 +191,7 @@ async function loadTable() {
   const flag = document.getElementById("f-flag").value;
   const search = document.getElementById("f-search").value.trim();
 
-  loadSummary(days, group, brand, flag, search);
-
-  let query = sb.rpc("fn_inventory_health", { p_days: days, p_group: group }, { count: "exact" });
+  let query = sb.rpc("fn_inventory_health", { p_days: days, p_group: group });
   if (brand) query = query.eq("brand", brand);
   if (flag) query = query.eq("health_flag", flag);
   if (search) query = query.or(`group_key.ilike.%${search}%,article.ilike.%${search}%,color.ilike.%${search}%`);
@@ -198,9 +204,16 @@ async function loadTable() {
   }
   query = query.range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
 
-  const { data, error, count } = await query;
+  // Run the summary tile and the table page as two independent, concurrent
+  // requests rather than one after another — same total data, roughly half
+  // the wall-clock time.
+  const [summary, { data, error }] = await Promise.all([
+    loadSummary(days, group, brand, flag, search),
+    query,
+  ]);
   if (error) { console.error(error); document.getElementById("table-body").innerHTML = `<tr><td colspan="10">Error: ${error.message}</td></tr>`; return; }
 
+  const count = summary?.total_groups ?? null;
   const colCount = group === "sku" ? 11 : 10;
   document.getElementById("result-count").textContent = count != null ? `${count.toLocaleString("en-IN")} ${groupNoun(group)}` : "";
   document.getElementById("page-label").textContent = `Page ${page + 1}${count ? " of " + Math.ceil(count / PAGE_SIZE) : ""}`;

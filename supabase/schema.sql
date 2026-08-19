@@ -216,7 +216,7 @@ RETURNS TABLE (
   sell_through_rate numeric,
   health_flag       text,
   is_legacy         boolean
-) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
+) LANGUAGE sql STABLE SET search_path = public, pg_temp SET work_mem = '64MB' AS $$
   WITH agg AS (
     SELECT vinculum_sku,
            SUM(units_sold) AS units_sold,
@@ -292,7 +292,7 @@ RETURNS TABLE (
   discontinued_out_skus bigint,
   legacy_skus        bigint,
   sell_through_rate  numeric
-) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
+) LANGUAGE sql STABLE SET search_path = public, pg_temp SET work_mem = '64MB' AS $$
   SELECT
     COUNT(*),
     SUM(available_qty)::bigint,
@@ -334,7 +334,7 @@ RETURNS TABLE (
   sell_through_rate numeric,
   health_flag       text,
   is_legacy         boolean
-) LANGUAGE plpgsql STABLE SET search_path = public, pg_temp AS $$
+) LANGUAGE plpgsql STABLE SET search_path = public, pg_temp SET work_mem = '64MB' AS $$
 BEGIN
   IF p_group = 'sku' THEN
     RETURN QUERY
@@ -416,7 +416,7 @@ CREATE OR REPLACE FUNCTION fn_inventory_health_summary(
 RETURNS TABLE (
   total_groups bigint,
   total_stock  numeric
-) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
+) LANGUAGE sql STABLE SET search_path = public, pg_temp SET work_mem = '64MB' AS $$
   SELECT
     COUNT(*)::bigint,
     COALESCE(SUM(h.available_qty), 0)

@@ -123,6 +123,7 @@ th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacin
 td { padding: 8px 10px; border-bottom: 1px solid var(--gridline); font-variant-numeric: tabular-nums; }
 tr:hover td { background: var(--page); }
 .table-wrap { max-height: 560px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+.totals-row td { border-top: 2px solid var(--gridline); border-bottom: none; background: var(--surface-1); position: sticky; bottom: 0; }
 
 .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
 .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; }

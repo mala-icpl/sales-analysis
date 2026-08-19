@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="assets/style.css">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="assets/config.js"></script>
 <script src="assets/supabase-client.js"></script>
 <script src="assets/charts.js"></script>
@@ -30,6 +31,7 @@
       <select id="f-portal"><option value="">All portals</option></select>
       <label>Brand</label>
       <select id="f-brand"><option value="">All brands</option></select>
+      <button class="btn secondary" id="btn-download-filtered" style="margin-left:auto">Download filtered sheet</button>
     </div>
 
     <div id="empty-state" class="empty-state" style="display:none">
@@ -38,7 +40,9 @@
 
     <div id="content" style="display:none">
       <div class="kpi-row">
+        <div class="kpi-tile"><div class="kpi-label">Total revenue</div><div class="kpi-value" id="kpi-total-revenue">—</div></div>
         <div class="kpi-tile"><div class="kpi-label">Net revenue</div><div class="kpi-value" id="kpi-revenue">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label">Total order qty</div><div class="kpi-value" id="kpi-total-qty">—</div></div>
         <div class="kpi-tile"><div class="kpi-label">Units sold (net)</div><div class="kpi-value" id="kpi-units">—</div></div>
         <div class="kpi-tile"><div class="kpi-label">Units returned</div><div class="kpi-value" id="kpi-returned">—</div></div>
         <div class="kpi-tile"><div class="kpi-label">Return rate</div><div class="kpi-value" id="kpi-return-rate">—</div></div>
@@ -75,8 +79,11 @@
         <h2>Portal × Brand breakdown</h2>
         <div class="table-wrap" style="max-height:320px">
           <table>
-            <thead><tr><th>Portal</th><th>Brand</th><th>Units sold</th><th>Units returned</th><th>Net revenue</th></tr></thead>
+            <thead><tr id="matrix-head-row">
+              <th data-sort="portal">Portal</th><th data-sort="brand">Brand</th><th data-sort="total_qty">Total qty</th><th data-sort="units_sold">Units sold</th><th data-sort="units_returned">Units returned</th><th data-sort="total_revenue">Total revenue</th><th data-sort="net_revenue">Net revenue</th>
+            </tr></thead>
             <tbody id="matrix-body"></tbody>
+            <tfoot><tr id="matrix-totals" class="totals-row"></tr></tfoot>
           </table>
         </div>
       </div>
@@ -85,13 +92,17 @@
         <div class="card">
           <h2>Top 15 SKUs by revenue</h2>
           <div class="table-wrap" style="max-height:400px">
-            <table><thead><tr><th>SKU</th><th>Brand</th><th>Units</th><th>Revenue</th></tr></thead><tbody id="top-body"></tbody></table>
+            <table><thead><tr id="top-head-row">
+              <th data-sort="vinculum_sku">SKU</th><th data-sort="brand">Brand</th><th data-sort="units_sold">Units</th><th data-sort="net_revenue">Revenue</th>
+            </tr></thead><tbody id="top-body"></tbody></table>
           </div>
         </div>
         <div class="card">
           <h2>Bottom 15 SKUs by revenue (still selling)</h2>
           <div class="table-wrap" style="max-height:400px">
-            <table><thead><tr><th>SKU</th><th>Brand</th><th>Units</th><th>Revenue</th></tr></thead><tbody id="bottom-body"></tbody></table>
+            <table><thead><tr id="bottom-head-row">
+              <th data-sort="vinculum_sku">SKU</th><th data-sort="brand">Brand</th><th data-sort="units_sold">Units</th><th data-sort="net_revenue">Revenue</th>
+            </tr></thead><tbody id="bottom-body"></tbody></table>
           </div>
         </div>
       </div>
@@ -167,10 +178,14 @@ function filteredRows() {
 
 function renderKpis(rows) {
   const revenue = rows.reduce((a, r) => a + Number(r.net_revenue || 0), 0);
+  const totalRevenue = rows.reduce((a, r) => a + Number(r.total_revenue || 0), 0);
+  const totalQty = rows.reduce((a, r) => a + Number(r.total_qty || 0), 0);
   const units = rows.reduce((a, r) => a + Number(r.units_sold || 0), 0);
   const returned = rows.reduce((a, r) => a + Number(r.units_returned || 0), 0);
   const orders = rows.reduce((a, r) => a + Number(r.orders || 0), 0);
+  document.getElementById("kpi-total-revenue").textContent = fmtINR(totalRevenue);
   document.getElementById("kpi-revenue").textContent = fmtINR(revenue);
+  document.getElementById("kpi-total-qty").textContent = fmtNum(totalQty);
   document.getElementById("kpi-units").textContent = fmtNum(units);
   document.getElementById("kpi-returned").textContent = fmtNum(returned);
   document.getElementById("kpi-return-rate").textContent = (units + returned) ? ((100 * returned / (units + returned)).toFixed(1) + "%") : "—";
@@ -211,21 +226,86 @@ function renderTrend(rows) {
   charts.trend = lineChart("chart-trend", periods, datasets, m.formatter);
 }
 
+// Generic click-to-sort wiring for a <tr> of <th data-sort="col"> headers.
+// Returns a state object {col, asc} the caller reads when re-rendering, and
+// keeps the header labels updated with a ▲/▼ indicator on the active column.
+function makeSortableHead(rowEl, initialCol, initialAsc, onSort) {
+  const state = { col: initialCol, asc: initialAsc };
+  function updateIndicators() {
+    rowEl.querySelectorAll("th[data-sort]").forEach(th => {
+      if (!th.dataset.label) th.dataset.label = th.textContent.trim();
+      th.textContent = th.dataset.label + (th.dataset.sort === state.col ? (state.asc ? " ▲" : " ▼") : "");
+    });
+  }
+  rowEl.querySelectorAll("th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      if (state.col === th.dataset.sort) state.asc = !state.asc; else { state.col = th.dataset.sort; state.asc = false; }
+      updateIndicators();
+      onSort(state);
+    });
+  });
+  updateIndicators();
+  return state;
+}
+function sortRows(rows, col, asc) {
+  if (!col) return rows;
+  return [...rows].sort((a, b) => {
+    const va = a[col], vb = b[col];
+    const cmp = (typeof va === "string" || typeof vb === "string")
+      ? String(va || "").localeCompare(String(vb || ""))
+      : (Number(va) || 0) - (Number(vb) || 0);
+    return asc ? cmp : -cmp;
+  });
+}
+
+let matrixRowsCache = [];
 function renderMatrix(rows) {
   const key = r => r.portal + "||" + r.brand;
   const grouped = {};
   rows.forEach(r => {
     const k = key(r);
-    if (!grouped[k]) grouped[k] = { portal: r.portal, brand: r.brand, units_sold: 0, units_returned: 0, net_revenue: 0 };
+    if (!grouped[k]) grouped[k] = { portal: r.portal, brand: r.brand, total_qty: 0, units_sold: 0, units_returned: 0, total_revenue: 0, net_revenue: 0 };
+    grouped[k].total_qty += Number(r.total_qty || 0);
     grouped[k].units_sold += Number(r.units_sold || 0);
     grouped[k].units_returned += Number(r.units_returned || 0);
+    grouped[k].total_revenue += Number(r.total_revenue || 0);
     grouped[k].net_revenue += Number(r.net_revenue || 0);
   });
-  const arr = Object.values(grouped).sort((a, b) => b.net_revenue - a.net_revenue);
-  document.getElementById("matrix-body").innerHTML = arr.map(r => `
-    <tr><td>${r.portal}</td><td>${r.brand}</td><td>${fmtNum(r.units_sold)}</td><td>${fmtNum(r.units_returned)}</td><td>${fmtINR(r.net_revenue)}</td></tr>
-  `).join("") || `<tr><td colspan="5" class="empty-state">No data</td></tr>`;
+  matrixRowsCache = Object.values(grouped);
+  renderMatrixRows();
 }
+function renderMatrixRows() {
+  const arr = sortRows(matrixRowsCache, matrixSort.col, matrixSort.asc);
+  document.getElementById("matrix-body").innerHTML = arr.map(r => `
+    <tr><td>${r.portal}</td><td>${r.brand}</td><td>${fmtNum(r.total_qty)}</td><td>${fmtNum(r.units_sold)}</td><td>${fmtNum(r.units_returned)}</td><td>${fmtINR(r.total_revenue)}</td><td>${fmtINR(r.net_revenue)}</td></tr>
+  `).join("") || `<tr><td colspan="7" class="empty-state">No data</td></tr>`;
+
+  const totals = arr.reduce((a, r) => ({
+    total_qty: a.total_qty + r.total_qty,
+    units_sold: a.units_sold + r.units_sold,
+    units_returned: a.units_returned + r.units_returned,
+    total_revenue: a.total_revenue + r.total_revenue,
+    net_revenue: a.net_revenue + r.net_revenue,
+  }), { total_qty: 0, units_sold: 0, units_returned: 0, total_revenue: 0, net_revenue: 0 });
+  document.getElementById("matrix-totals").innerHTML = arr.length ? `
+    <td><strong>Total</strong></td><td></td><td><strong>${fmtNum(totals.total_qty)}</strong></td><td><strong>${fmtNum(totals.units_sold)}</strong></td><td><strong>${fmtNum(totals.units_returned)}</strong></td><td><strong>${fmtINR(totals.total_revenue)}</strong></td><td><strong>${fmtINR(totals.net_revenue)}</strong></td>
+  ` : "";
+}
+const matrixSort = makeSortableHead(document.getElementById("matrix-head-row"), "net_revenue", false, renderMatrixRows);
+
+let topRowsCache = [], bottomRowsCache = [];
+function renderTopTable() {
+  const arr = sortRows(topRowsCache, topSort.col, topSort.asc);
+  const row = r => `<tr><td class="mono">${r.vinculum_sku}</td><td>${r.brand || "—"}</td><td>${fmtNum(r.units_sold)}</td><td>${fmtINR(r.net_revenue)}</td></tr>`;
+  document.getElementById("top-body").innerHTML = arr.map(row).join("") || `<tr><td colspan="4" class="empty-state">No data</td></tr>`;
+}
+function renderBottomTable() {
+  const arr = sortRows(bottomRowsCache, bottomSort.col, bottomSort.asc);
+  const row = r => `<tr><td class="mono">${r.vinculum_sku}</td><td>${r.brand || "—"}</td><td>${fmtNum(r.units_sold)}</td><td>${fmtINR(r.net_revenue)}</td></tr>`;
+  document.getElementById("bottom-body").innerHTML = arr.map(row).join("") || `<tr><td colspan="4" class="empty-state">No data</td></tr>`;
+}
+const topSort = makeSortableHead(document.getElementById("top-head-row"), null, false, renderTopTable);
+const bottomSort = makeSortableHead(document.getElementById("bottom-head-row"), null, false, renderBottomTable);
 
 async function renderTopBottom() {
   const period = document.getElementById("f-period").value || null;
@@ -233,9 +313,10 @@ async function renderTopBottom() {
     sb.rpc("fn_top_skus", { p_period_key: period, p_limit: 15, p_ascending: false }),
     sb.rpc("fn_top_skus", { p_period_key: period, p_limit: 15, p_ascending: true }),
   ]);
-  const row = r => `<tr><td class="mono">${r.vinculum_sku}</td><td>${r.brand || "—"}</td><td>${fmtNum(r.units_sold)}</td><td>${fmtINR(r.net_revenue)}</td></tr>`;
-  document.getElementById("top-body").innerHTML = (top || []).map(row).join("") || `<tr><td colspan="4" class="empty-state">No data</td></tr>`;
-  document.getElementById("bottom-body").innerHTML = (bottom || []).filter(r => Number(r.units_sold) > 0).map(row).join("") || `<tr><td colspan="4" class="empty-state">No data</td></tr>`;
+  topRowsCache = top || [];
+  bottomRowsCache = (bottom || []).filter(r => Number(r.units_sold) > 0);
+  renderTopTable();
+  renderBottomTable();
 }
 
 async function loadPage() {
@@ -376,6 +457,22 @@ function renderComparePeriods() {
 ["cmp-a", "cmp-b"].forEach(id => document.getElementById(id).addEventListener("change", renderComparePeriods));
 wireMetricToggle("main-metric-toggle", (m) => { mainMetric = m; refresh(); });
 wireMetricToggle("cmp-metric-toggle", (m) => { cmpMetric = m; renderComparePeriods(); });
+
+document.getElementById("btn-download-filtered").addEventListener("click", () => {
+  const arr = sortRows(matrixRowsCache, matrixSort.col, matrixSort.asc);
+  if (arr.length === 0) { alert("No rows to download for the current filters."); return; }
+  const header = ["Portal", "Brand", "Total qty", "Units sold", "Units returned", "Total revenue", "Net revenue"];
+  const aoa = [header, ...arr.map(r => [r.portal, r.brand, r.total_qty, r.units_sold, r.units_returned, r.total_revenue, r.net_revenue])];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Portal x Brand");
+  const period = document.getElementById("f-period").value;
+  const portal = document.getElementById("f-portal").value;
+  const brand = document.getElementById("f-brand").value;
+  const safe = s => (s || "all").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+  XLSX.writeFile(wb, `sales_portal_brand_${safe(period)}_${safe(portal)}_${safe(brand)}_${new Date().toISOString().slice(0,10)}.xlsx`);
+});
+
 loadPage();
 </script>
 </body>

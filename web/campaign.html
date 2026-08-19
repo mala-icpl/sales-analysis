@@ -6,6 +6,7 @@
 <title>Portal Opportunity — Iconic Creation Inventory Dashboard</title>
 <link rel="stylesheet" href="assets/style.css">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="assets/config.js"></script>
 <script src="assets/supabase-client.js"></script>
 <script src="assets/charts.js"></script>
@@ -43,7 +44,8 @@
       <label>Brand</label>
       <select id="f-brand"><option value="">All brands</option></select>
       <input type="text" id="f-search" placeholder="Search article / colour…" style="width:220px">
-      <span class="text-muted" id="result-count" style="margin-left:auto"></span>
+      <button class="btn secondary" id="btn-download-filtered" style="margin-left:auto">Download filtered sheet</button>
+      <span class="text-muted" id="result-count"></span>
     </div>
 
     <div class="filter-row" id="period-row">
@@ -56,6 +58,10 @@
     </div>
 
     <div id="content" style="display:none">
+      <div class="kpi-row" id="opp-summary-row" style="margin-bottom:14px">
+        <div class="kpi-tile"><div class="kpi-label" id="opp-summary-stock-label">Total stock</div><div class="kpi-value" id="opp-summary-stock">—</div></div>
+        <div class="kpi-tile"><div class="kpi-label" id="opp-summary-units-label">Total units (selected months)</div><div class="kpi-value" id="opp-summary-units">—</div></div>
+      </div>
       <div class="table-wrap">
         <table>
           <thead><tr id="table-head-row"></tr></thead>
@@ -141,8 +147,17 @@ function renderHead() {
     th.addEventListener("click", () => {
       const col = th.dataset.sort;
       if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = false; }
+      updateSortIndicators();
       renderRows();
     });
+  });
+  updateSortIndicators();
+}
+
+function updateSortIndicators() {
+  document.querySelectorAll("th[data-sort]").forEach(th => {
+    if (!th.dataset.label) th.dataset.label = th.textContent.trim();
+    th.textContent = th.dataset.label + (th.dataset.sort === sortCol ? (sortAsc ? " ▲" : " ▼") : "");
   });
 }
 
@@ -194,6 +209,7 @@ async function loadTable() {
   renderRows();
 }
 
+let currentFilteredRows = [];
 function renderRows() {
   const brand = document.getElementById("f-brand").value;
   const search = document.getElementById("f-search").value.trim().toLowerCase();
@@ -209,6 +225,14 @@ function renderRows() {
     const latest = selectedPeriods[selectedPeriods.length - 1];
     rows = [...rows].sort((a, b) => (b.periods[latest]?.other_units ?? 0) - (a.periods[latest]?.other_units ?? 0));
   }
+  currentFilteredRows = rows;
+
+  const totalStock = rows.reduce((a, r) => a + Number(r.available_qty || 0), 0);
+  const totalUnits = rows.reduce((a, r) => a + Object.values(r.periods).reduce((s, p) => s + (p.portal_units || 0) + (p.other_units || 0), 0), 0);
+  document.getElementById("opp-summary-stock-label").textContent = brand ? `Total stock — ${brand}` : "Total stock";
+  document.getElementById("opp-summary-units-label").textContent = brand ? `Total units — ${brand}` : "Total units (selected months)";
+  document.getElementById("opp-summary-stock").textContent = fmtNum(totalStock);
+  document.getElementById("opp-summary-units").textContent = fmtNum(totalUnits);
 
   document.getElementById("result-count").textContent = `${rows.length.toLocaleString("en-IN")} groups`;
   const pageRows = rows.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
@@ -238,6 +262,24 @@ let searchTimer;
 document.getElementById("f-search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { page = 0; renderRows(); }, 350); });
 document.getElementById("prev-page").addEventListener("click", () => { if (page > 0) { page--; renderRows(); } });
 document.getElementById("next-page").addEventListener("click", () => { page++; renderRows(); });
+
+document.getElementById("btn-download-filtered").addEventListener("click", () => {
+  if (currentFilteredRows.length === 0) { alert("No rows to download for the current filters."); return; }
+  const g = currentGroup();
+  const groupLabel = g === "sku" ? "SKU" : (g === "article" ? "Article" : "Article + Colour");
+  const portal = currentPortal();
+  const header = [groupLabel, "# SKUs", "Brand", "Stock", ...selectedPeriods.flatMap(p => [`${portal} — ${p}`, `Other portals — ${p}`])];
+  const aoa = [header, ...currentFilteredRows.map(r => [
+    r.group_key, r.sku_count, r.brand || "", r.available_qty,
+    ...selectedPeriods.flatMap(p => { const v = r.periods[p] || { portal_units: 0, other_units: 0 }; return [v.portal_units, v.other_units]; }),
+  ])];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Portal Opportunity");
+  const brand = document.getElementById("f-brand").value;
+  const safe = s => (s || "all").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+  XLSX.writeFile(wb, `portal_opportunity_${safe(portal)}_${safe(brand)}_${new Date().toISOString().slice(0,10)}.xlsx`);
+});
 
 (async function init() {
   await populateBrandFilter();

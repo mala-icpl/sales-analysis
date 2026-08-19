@@ -401,6 +401,34 @@ BEGIN
 END;
 $$;
 
+-- Aggregate counterpart to fn_inventory_health: same grouping + same filter
+-- semantics (brand/health-flag exact match, search across group_key/article/
+-- color), but returns just the totals instead of paginated rows. Powers the
+-- "Total inventory" summary tile on the Inventory Health page, which needs
+-- to reflect ALL matching rows, not just the current page.
+CREATE OR REPLACE FUNCTION fn_inventory_health_summary(
+  p_days   int  DEFAULT 30,
+  p_group  text DEFAULT 'sku',
+  p_brand  text DEFAULT NULL,
+  p_flag   text DEFAULT NULL,
+  p_search text DEFAULT NULL
+)
+RETURNS TABLE (
+  total_groups bigint,
+  total_stock  numeric
+) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
+  SELECT
+    COUNT(*)::bigint,
+    COALESCE(SUM(h.available_qty), 0)
+  FROM fn_inventory_health(p_days, p_group) h
+  WHERE (p_brand IS NULL OR h.brand = p_brand)
+    AND (p_flag IS NULL OR h.health_flag = p_flag)
+    AND (p_search IS NULL OR p_search = '' OR
+         h.group_key ILIKE '%' || p_search || '%' OR
+         h.article   ILIKE '%' || p_search || '%' OR
+         h.color     ILIKE '%' || p_search || '%')
+$$;
+
 -- Portal x Brand sales rollup for a trailing window — feeds the Overview and
 -- Sales Analysis charts without shipping row-level data to the browser.
 CREATE OR REPLACE FUNCTION fn_portal_brand_summary(p_days int DEFAULT 30)
@@ -430,9 +458,11 @@ RETURNS TABLE (
   period_key     text,
   portal         text,
   brand          text,
+  total_qty      numeric,
   units_sold     numeric,
   units_returned numeric,
   units_cancelled numeric,
+  total_revenue  numeric,
   net_revenue    numeric,
   orders         bigint
 ) LANGUAGE sql STABLE SET search_path = public, pg_temp AS $$
@@ -440,9 +470,11 @@ RETURNS TABLE (
     s.period_key,
     s.portal,
     s.brand,
+    SUM(s.qty),
     SUM(CASE WHEN s.status IN ('Shipped complete','delivered','Pick complete','Packed') THEN s.qty ELSE 0 END),
     SUM(CASE WHEN s.status = 'Shipped & Returned' THEN s.qty ELSE 0 END),
     SUM(CASE WHEN s.status = 'Cancelled' THEN s.qty ELSE 0 END),
+    SUM(s.line_amount),
     SUM(CASE WHEN s.status IN ('Shipped complete','delivered','Pick complete','Packed') THEN s.line_amount ELSE 0 END),
     COUNT(DISTINCT s.invoice_no)
   FROM sales s

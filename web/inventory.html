@@ -6,6 +6,7 @@
 <title>Inventory Health — Iconic Creation Inventory Dashboard</title>
 <link rel="stylesheet" href="assets/style.css">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="assets/config.js"></script>
 <script src="assets/supabase-client.js"></script>
 <script src="assets/charts.js"></script>
@@ -22,11 +23,23 @@
       </div>
     </div>
 
+    <div class="kpi-row" id="inv-summary-row" style="margin-bottom:16px">
+      <div class="kpi-tile">
+        <div class="kpi-label" id="inv-summary-stock-label">Total stock</div>
+        <div class="kpi-value" id="inv-summary-stock">—</div>
+      </div>
+      <div class="kpi-tile">
+        <div class="kpi-label" id="inv-summary-groups-label">Groups</div>
+        <div class="kpi-value" id="inv-summary-groups">—</div>
+      </div>
+    </div>
+
     <div class="filter-row">
       <label>Group by</label>
       <select id="f-group">
         <option value="article_color">Article + Colour</option>
         <option value="article">Article</option>
+        <option value="sku">SKU</option>
       </select>
       <label>Window</label>
       <select id="f-days">
@@ -49,6 +62,11 @@
       </select>
       <input type="text" id="f-search" placeholder="Search article / colour…" style="width:220px">
       <span class="text-muted" id="result-count" style="margin-left:auto"></span>
+    </div>
+
+    <div class="filter-row" style="margin-top:-8px">
+      <button class="btn secondary" id="btn-download-filtered">⬇ Download filtered results (.xlsx)</button>
+      <span class="text-muted" id="download-status"></span>
     </div>
 
     <div class="table-wrap">
@@ -92,10 +110,18 @@ function currentGroup() {
 
 function renderHead() {
   const g = currentGroup();
-  const groupLabel = g === "article" ? "Article" : "Article + Colour";
+  const groupLabel = g === "article" ? "Article" : g === "sku" ? "SKU" : "Article + Colour";
+  // SKU view is the most granular (one row per exact SKU, size included) —
+  // "# SKUs" is always 1 there, not useful, so it's dropped; Article and
+  // Article + Colour are shown as extra reference columns instead, so you
+  // can still scan/sort at those levels without leaving SKU view.
+  const extraCols = g === "sku" ? `
+    <th data-sort="article">Article</th>
+    <th data-sort="article_color_combo">Article + Colour</th>
+  ` : `<th data-sort="sku_count"># SKUs</th>`;
   document.getElementById("table-head-row").innerHTML = `
     <th data-sort="group_key">${groupLabel}</th>
-    <th data-sort="sku_count"># SKUs</th>
+    ${extraCols}
     <th data-sort="brand">Brand</th>
     <th data-sort="article_status">Status</th>
     <th data-sort="available_qty">Stock</th>
@@ -113,12 +139,41 @@ function renderHead() {
       loadTable();
     });
   });
+  updateSortIndicators();
+}
+
+// Keeps every sortable header showing which column (and direction) the
+// table is currently sorted by — clicking a header was already wired up to
+// sort, but with no visual arrow it wasn't obvious sorting was available at
+// all, let alone which column was active.
+function updateSortIndicators() {
+  document.querySelectorAll("th[data-sort]").forEach(th => {
+    if (!th.dataset.label) th.dataset.label = th.textContent.trim();
+    th.textContent = th.dataset.label + (th.dataset.sort === sortCol ? (sortAsc ? " ▲" : " ▼") : "");
+  });
 }
 
 async function populateBrandFilter() {
   const { data } = await sb.rpc("fn_distinct_brands");
   const sel = document.getElementById("f-brand");
   (data || []).forEach(r => { const o = document.createElement("option"); o.value = r.brand; o.textContent = r.brand; sel.appendChild(o); });
+}
+
+function groupNoun(group, count) {
+  if (group === "sku") return "SKUs";
+  if (group === "article") return "articles";
+  return "article/colour groups";
+}
+
+async function loadSummary(days, group, brand, flag, search) {
+  const { data, error } = await sb.rpc("fn_inventory_health_summary", {
+    p_days: days, p_group: group, p_brand: brand || null, p_flag: flag || null, p_search: search || null,
+  }).maybeSingle();
+  if (error) { console.error(error); return; }
+  document.getElementById("inv-summary-stock-label").textContent = brand ? `Total stock — ${brand}` : "Total stock (filtered)";
+  document.getElementById("inv-summary-stock").textContent = fmtNum(data?.total_stock ?? 0);
+  document.getElementById("inv-summary-groups-label").textContent = "Total " + groupNoun(group);
+  document.getElementById("inv-summary-groups").textContent = fmtNum(data?.total_groups ?? 0);
 }
 
 async function loadTable() {
@@ -128,23 +183,34 @@ async function loadTable() {
   const flag = document.getElementById("f-flag").value;
   const search = document.getElementById("f-search").value.trim();
 
+  loadSummary(days, group, brand, flag, search);
+
   let query = sb.rpc("fn_inventory_health", { p_days: days, p_group: group }, { count: "exact" });
   if (brand) query = query.eq("brand", brand);
   if (flag) query = query.eq("health_flag", flag);
   if (search) query = query.or(`group_key.ilike.%${search}%,article.ilike.%${search}%,color.ilike.%${search}%`);
-  query = query.order(sortCol, { ascending: sortAsc, nullsFirst: false });
+  // "Article + Colour" in SKU view is a computed column (article + color),
+  // not a single physical one — sort by both underlying columns instead.
+  if (sortCol === "article_color_combo") {
+    query = query.order("article", { ascending: sortAsc, nullsFirst: false }).order("color", { ascending: sortAsc, nullsFirst: false });
+  } else {
+    query = query.order(sortCol, { ascending: sortAsc, nullsFirst: false });
+  }
   query = query.range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
 
   const { data, error, count } = await query;
   if (error) { console.error(error); document.getElementById("table-body").innerHTML = `<tr><td colspan="10">Error: ${error.message}</td></tr>`; return; }
 
-  document.getElementById("result-count").textContent = count != null ? `${count.toLocaleString("en-IN")} ${group === "article" ? "articles" : "article/colour groups"}` : "";
+  const colCount = group === "sku" ? 11 : 10;
+  document.getElementById("result-count").textContent = count != null ? `${count.toLocaleString("en-IN")} ${groupNoun(group)}` : "";
   document.getElementById("page-label").textContent = `Page ${page + 1}${count ? " of " + Math.ceil(count / PAGE_SIZE) : ""}`;
 
   document.getElementById("table-body").innerHTML = (data || []).map(r => `
     <tr>
       <td class="mono">${r.group_key || "—"}</td>
-      <td>${r.sku_count ?? "—"}</td>
+      ${group === "sku"
+        ? `<td class="mono text-muted">${r.article || "—"}</td><td class="mono text-muted">${r.article && r.color ? r.article + " " + r.color : "—"}</td>`
+        : `<td>${r.sku_count ?? "—"}</td>`}
       <td>${r.brand || "—"}</td>
       <td class="text-muted">${r.article_status || "—"}</td>
       <td>${fmtNum(r.available_qty)}</td>
@@ -154,8 +220,84 @@ async function loadTable() {
       <td>${r.sell_through_rate != null ? (r.sell_through_rate * 100).toFixed(1) + "%" : "—"}</td>
       <td>${badgeFor(r.health_flag)}</td>
     </tr>
-  `).join("") || `<tr><td colspan="10" class="empty-state">No matching rows.</td></tr>`;
+  `).join("") || `<tr><td colspan="${colCount}" class="empty-state">No matching rows.</td></tr>`;
+
+  updateSortIndicators();
 }
+
+// Downloads EVERY row matching the current filters (not just the current
+// page) as an .xlsx — same filters/sort as the on-screen table, fetched in
+// chunks since a filter like "all brands" can span tens of thousands of
+// rows that the table only ever shows 100 at a time.
+async function downloadFilteredInventory() {
+  const btn = document.getElementById("btn-download-filtered");
+  const statusEl = document.getElementById("download-status");
+  btn.disabled = true;
+  try {
+    const days = Number(document.getElementById("f-days").value);
+    const group = currentGroup();
+    const brand = document.getElementById("f-brand").value;
+    const flag = document.getElementById("f-flag").value;
+    const search = document.getElementById("f-search").value.trim();
+
+    let rows = [];
+    let from = 0;
+    const chunkSize = 1000;
+    while (true) {
+      statusEl.textContent = `Loading… ${rows.length.toLocaleString("en-IN")} rows so far`;
+      let query = sb.rpc("fn_inventory_health", { p_days: days, p_group: group });
+      if (brand) query = query.eq("brand", brand);
+      if (flag) query = query.eq("health_flag", flag);
+      if (search) query = query.or(`group_key.ilike.%${search}%,article.ilike.%${search}%,color.ilike.%${search}%`);
+      if (sortCol === "article_color_combo") {
+        query = query.order("article", { ascending: sortAsc, nullsFirst: false }).order("color", { ascending: sortAsc, nullsFirst: false });
+      } else {
+        query = query.order(sortCol, { ascending: sortAsc, nullsFirst: false });
+      }
+      query = query.range(from, from + chunkSize - 1);
+      const { data, error } = await query;
+      if (error) throw error;
+      rows = rows.concat(data || []);
+      if (!data || data.length < chunkSize) break;
+      from += chunkSize;
+    }
+
+    if (rows.length === 0) { statusEl.textContent = "No matching rows to download."; return; }
+
+    const groupLabel = group === "article" ? "Article" : group === "sku" ? "SKU" : "Article + Colour";
+    const exportRows = rows.map(r => {
+      const base = { [groupLabel]: r.group_key };
+      if (group === "sku") {
+        base["Article"] = r.article;
+        base["Article + Colour"] = r.article && r.color ? r.article + " " + r.color : "";
+      } else {
+        base["# SKUs"] = r.sku_count;
+      }
+      base["Brand"] = r.brand;
+      base["Status"] = r.article_status;
+      base["Stock"] = r.available_qty;
+      base["Sold (window)"] = r.units_sold;
+      base["Daily velocity"] = r.daily_velocity;
+      base["Cover (days)"] = r.stock_cover_days;
+      base["Sell-through"] = r.sell_through_rate != null ? (r.sell_through_rate * 100).toFixed(1) + "%" : "";
+      base["Health"] = HEALTH_LABEL[r.health_flag] || r.health_flag;
+      return base;
+    });
+
+    const ws = XLSX.utils.json_to_sheet(exportRows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Inventory Health");
+    const parts = ["inventory_health", group, brand || "all-brands", flag || "all-health", `${days}d`, new Date().toISOString().slice(0, 10)];
+    XLSX.writeFile(wb, parts.join("_").replace(/[^a-zA-Z0-9_.-]/g, "-") + ".xlsx");
+    statusEl.textContent = `Downloaded ${rows.length.toLocaleString("en-IN")} rows.`;
+  } catch (e) {
+    statusEl.textContent = "Failed: " + e.message;
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById("btn-download-filtered").addEventListener("click", downloadFilteredInventory);
 
 ["f-group"].forEach(id => document.getElementById(id).addEventListener("change", () => {
   sortCol = "stock_cover_days"; sortAsc = true; page = 0; renderHead(); loadTable();

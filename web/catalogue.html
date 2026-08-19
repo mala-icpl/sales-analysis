@@ -55,15 +55,16 @@
       <label>Category</label>
       <select id="f-category"><option value="">All categories</option></select>
       <input type="text" id="f-search" placeholder="Search article / title…" style="width:240px">
-      <span class="text-muted" id="result-count" style="margin-left:auto"></span>
+      <button class="btn secondary" id="btn-download-filtered" style="margin-left:auto">Download filtered sheet</button>
+      <span class="text-muted" id="result-count"></span>
     </div>
 
     <div class="table-wrap">
       <table>
         <thead>
-          <tr>
-            <th>Vinculum SKU</th><th>Article</th><th>Colour</th><th>Brand</th><th>Category</th>
-            <th>Display name</th><th>Upper</th><th>Sole</th><th>Heel type</th><th>Heel height</th><th>MRP</th>
+          <tr id="table-head-row">
+            <th data-sort="vinculum_sku">Vinculum SKU</th><th data-sort="article">Article</th><th data-sort="color">Colour</th><th data-sort="brand">Brand</th><th data-sort="category">Category</th>
+            <th data-sort="display_name">Display name</th><th data-sort="upper">Upper</th><th data-sort="sole">Sole</th><th data-sort="heel_type">Heel type</th><th data-sort="heel_height">Heel height</th><th data-sort="mrp">MRP</th>
           </tr>
         </thead>
         <tbody id="table-body"></tbody>
@@ -83,6 +84,25 @@ renderNav("catalogue");
 const PAGE_SIZE = 100;
 let page = 0;
 let totalCount = 0;
+let sortCol = null;   // null = default (most recently updated first)
+let sortAsc = false;
+
+function updateSortIndicators() {
+  document.querySelectorAll("#table-head-row th[data-sort]").forEach(th => {
+    if (!th.dataset.label) th.dataset.label = th.textContent.trim();
+    th.textContent = th.dataset.label + (th.dataset.sort === sortCol ? (sortAsc ? " ▲" : " ▼") : "");
+  });
+}
+document.querySelectorAll("#table-head-row th[data-sort]").forEach(th => {
+  th.addEventListener("click", () => {
+    const col = th.dataset.sort;
+    if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = false; }
+    updateSortIndicators();
+    page = 0;
+    loadTable();
+  });
+});
+updateSortIndicators();
 
 function log(msg) {
   const el = document.getElementById("log-catalogue");
@@ -123,7 +143,10 @@ async function loadTable() {
   if (brand) query = query.eq("brand", brand);
   if (category) query = query.eq("category", category);
   if (search) query = query.or(`article.ilike.%${search}%,display_name.ilike.%${search}%,vinculum_sku.ilike.%${search}%`);
-  query = query.order("updated_at", { ascending: false }).range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+  query = sortCol
+    ? query.order(sortCol, { ascending: sortAsc, nullsFirst: false })
+    : query.order("updated_at", { ascending: false });
+  query = query.range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
 
   const { data, error, count } = await query;
   if (error) { console.error(error); return; }
@@ -204,6 +227,32 @@ document.getElementById("btn-download-catalogue").addEventListener("click", asyn
   }
   if (rows.length === 0) { alert("No catalogue data yet."); return; }
   downloadRows(rows, `catalogue_${new Date().toISOString().slice(0,10)}.xlsx`);
+});
+
+document.getElementById("btn-download-filtered").addEventListener("click", async () => {
+  const brand = document.getElementById("f-brand").value;
+  const category = document.getElementById("f-category").value;
+  const search = document.getElementById("f-search").value.trim();
+
+  let rows = [];
+  let from = 0;
+  const pageSize = 1000;
+  while (true) {
+    let query = sb.from("catalogue_master").select("*");
+    if (brand) query = query.eq("brand", brand);
+    if (category) query = query.eq("category", category);
+    if (search) query = query.or(`article.ilike.%${search}%,display_name.ilike.%${search}%,vinculum_sku.ilike.%${search}%`);
+    query = sortCol ? query.order(sortCol, { ascending: sortAsc, nullsFirst: false }) : query.order("updated_at", { ascending: false });
+    query = query.range(from, from + pageSize - 1);
+    const { data, error } = await query;
+    if (error) { alert("Failed: " + error.message); return; }
+    rows = rows.concat(data || []);
+    if (!data || data.length < pageSize) break;
+    from += pageSize;
+  }
+  if (rows.length === 0) { alert("No catalogue entries match the current filters."); return; }
+  const safe = s => (s || "all").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+  downloadRows(rows, `catalogue_filtered_${safe(brand)}_${safe(category)}_${new Date().toISOString().slice(0,10)}.xlsx`);
 });
 
 document.getElementById("file-catalogue").addEventListener("change", () => {
